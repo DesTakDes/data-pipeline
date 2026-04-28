@@ -1,0 +1,393 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from datetime import datetime, timedelta
+import json
+
+default_args = {
+    'owner': 'data-team',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'email_on_failure': False,
+}
+
+# ── Helper functions ───────────────────────────────────────────────────────────
+
+def get_schema_from_table(pg, table_name):
+    """Ambil schema kolom dari tabel PostgreSQL yang sudah ada."""
+    schema_name, tbl = table_name.split('.')
+    rows = pg.get_records(f"""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = '{schema_name}'
+          AND table_name   = '{tbl}'
+          AND column_name NOT IN ('_id', '_date_partition', '_processed_at', 'loaded_at', 'date_partition')
+        ORDER BY ordinal_position
+    """)
+    schema = {}
+    for col, dtype in rows:
+        if 'int' in dtype:
+            schema[col] = 'BIGINT'
+        elif 'numeric' in dtype or 'float' in dtype or 'double' in dtype:
+            schema[col] = 'NUMERIC'
+        elif 'timestamp' in dtype:
+            schema[col] = 'TIMESTAMP'
+        else:
+            schema[col] = 'TEXT'
+    return schema
+
+
+def apply_transforms(pg, source_table, transforms, schema):
+    current_table = source_table
+    step_num = 0
+
+    for t in transforms:
+        node_type = t.get('type', '')
+        config    = t.get('config') or {}
+        step_num += 1
+        temp_table = f'staging._transform_step_{step_num}'
+
+        # ── Refresh schema dari tabel saat ini ──────────────────
+        # Ini penting agar kolom yang sudah di-drop/rename tidak dipakai lagi
+        from airflow.providers.postgres.hooks.postgres import PostgresHook
+        current_schema = get_schema_from_table(pg, current_table)
+        current_cols   = list(current_schema.keys())
+        col_list_all   = ', '.join([f'"{c}"' for c in current_cols])
+
+        if node_type == 'filter_rows':
+            formula = config.get('formula', '1=1')
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT * FROM {current_table} WHERE {formula}')
+
+        elif node_type == 'select_col':
+            cols = [c for c in config.get('columns', current_cols) if c in current_cols]
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {", ".join([f"{chr(34)}{c}{chr(34)}" for c in cols])} FROM {current_table}')
+
+        elif node_type == 'drop_col':
+            keep = [c for c in current_cols if c not in set(config.get('columns', []))]
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {", ".join([f"{chr(34)}{c}{chr(34)}" for c in keep])} FROM {current_table}')
+
+        elif node_type == 'rename_col':
+            renames = config.get('renames', {})
+            exprs = [f'"{c}" AS "{renames.get(c,c)}"' for c in current_cols]
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {", ".join(exprs)} FROM {current_table}')
+
+        elif node_type == 'add_const':
+            name  = config.get('name', 'new_col')
+            val   = config.get('value', 'NULL')
+            dtype = config.get('dtype', 'TEXT')
+            pg.run(f"CREATE TABLE {temp_table} AS SELECT {col_list_all}, CAST({val!r} AS {dtype}) AS \"{name}\" FROM {current_table}")
+
+        elif node_type == 'fill_null':
+            fill_cols = config.get('columns', [])
+            fill_val  = config.get('fillValue', '')
+            fill_type = config.get('fillType', 'value')
+            exprs = []
+            for c in current_cols:
+                if c in fill_cols:
+                    if fill_type == 'value':
+                        exprs.append(f"COALESCE(\"{c}\", {fill_val!r}) AS \"{c}\"")
+                    elif fill_type == 'mean':
+                        exprs.append(f'COALESCE("{c}", AVG("{c}") OVER()) AS "{c}"')
+                    elif fill_type == 'mode':
+                        exprs.append(f'COALESCE("{c}", (SELECT "{c}" FROM {current_table} WHERE "{c}" IS NOT NULL GROUP BY "{c}" ORDER BY COUNT(*) DESC LIMIT 1)) AS "{c}"')
+                    else:
+                        exprs.append(f"COALESCE(\"{c}\", {fill_val!r}) AS \"{c}\"")
+                else:
+                    exprs.append(f'"{c}"')
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {", ".join(exprs)} FROM {current_table}')
+
+        elif node_type == 'order_table':
+            orders = config.get('orders', [])
+            # Filter hanya kolom yang ada
+            valid_orders = [o for o in orders if o['col'] in current_cols]
+            order_clause = ', '.join([f'"{o["col"]}" {o.get("dir","ASC")}' for o in valid_orders]) if valid_orders else '1'
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {col_list_all} FROM {current_table} ORDER BY {order_clause}')
+
+        elif node_type == 'change_type':
+            types = config.get('types', {})
+            exprs = [f'"{c}"::TEXT::{types[c]} AS "{c}"' if c in types else f'"{c}"' for c in current_cols]
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {", ".join(exprs)} FROM {current_table}')
+
+        elif node_type == 'set_val':
+            target = config.get('targetCol', '')
+            expr   = config.get('expr', 'NULL') if config.get('useExpr') else f'"{config.get("sourceCol","NULL")}"'
+            exprs  = [f'{expr} AS "{c}"' if c == target else f'"{c}"' for c in current_cols]
+            pg.run(f'CREATE TABLE {temp_table} AS SELECT {", ".join(exprs)} FROM {current_table}')
+
+        elif node_type == 'val_mapper':
+            src      = config.get('sourceCol', '')
+            new_col  = config.get('newColName', 'mapped')
+            else_val = config.get('elseValue', 'NULL')
+            whens    = config.get('whens', [])
+            cases    = ' '.join([
+                f"WHEN \"{src}\" {w.get('condition','=')} {w.get('value','')!r} THEN {w.get('result','')!r}"
+                for w in whens
+            ])
+            pg.run(f"CREATE TABLE {temp_table} AS SELECT {col_list_all}, CASE {cases} ELSE {else_val!r} END AS \"{new_col}\" FROM {current_table}")
+
+        elif node_type == 'group_agg':
+            group_cols = [c for c in config.get('groupCols', []) if c in current_cols]
+            agg_cols   = config.get('aggCols', [])
+            # Filter agg_cols yang ada di current table
+            valid_agg  = [a for a in agg_cols if a['col'] in current_cols]
+            if group_cols and valid_agg:
+                g = ', '.join([f'"{c}"' for c in group_cols])
+                a = ', '.join([f'{x["func"]}("{x["col"]}") AS "{x["alias"]}"' for x in valid_agg])
+                pg.run(f'CREATE TABLE {temp_table} AS SELECT {g}, {a} FROM {current_table} GROUP BY {g}')
+            else:
+                print(f'[group_agg] Skipped — no valid columns')
+                temp_table = current_table
+
+        elif node_type == 'join_data':
+            print(f'[Join] join_type={config.get("joinType")} left={config.get("leftCol")} right={config.get("rightCol")}')
+            temp_table = current_table
+
+        elif node_type == 'pyspark':
+            print(f'[PySpark] Logged — requires Spark setup')
+            temp_table = current_table
+
+        else:
+            print(f'[Transform] Unknown: {node_type}, skip')
+            temp_table = current_table
+
+        if temp_table != current_table:
+            current_table = temp_table
+            print(f'Step {step_num} ({node_type}) → {current_table}')
+
+    return current_table
+
+
+def sync_table_schema(pg, table_name, schema, extra_cols=None):
+    """Buat tabel baru atau tambah kolom yang belum ada."""
+    schema_name, tbl = table_name.split('.')
+    exists = pg.get_first(f"""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_schema = '{schema_name}'
+            AND table_name = '{tbl}'
+        )
+    """)[0]
+
+    if not exists:
+        col_defs = ', '.join([f'"{col}" {dtype}' for col, dtype in schema.items()])
+        extra    = (', ' + ', '.join(extra_cols)) if extra_cols else ''
+        pg.run(f"""
+            CREATE TABLE {table_name} (
+                _id SERIAL PRIMARY KEY,
+                {col_defs}
+                {extra}
+            )
+        """)
+        print(f'Tabel {table_name} dibuat')
+    else:
+        existing = {r[0] for r in pg.get_records(f"""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = '{schema_name}' AND table_name = '{tbl}'
+        """)}
+        for col, dtype in schema.items():
+            if col not in existing:
+                pg.run(f'ALTER TABLE {table_name} ADD COLUMN "{col}" {dtype}')
+                print(f'Kolom baru ditambah: {col}')
+        if extra_cols:
+            for extra_def in extra_cols:
+                col_name = extra_def.split()[0].strip('"')
+                if col_name not in existing:
+                    pg.run(f'ALTER TABLE {table_name} ADD COLUMN {extra_def}')
+
+
+# ── ETL Functions ──────────────────────────────────────────────────────────────
+
+def extract(**context):
+    """
+    Baca dari staging table yang sudah diupload frontend.
+    Tidak pakai CSV_PATH — semua dari dag_run.conf.
+    """
+    pg   = PostgresHook(postgres_conn_id='postgres_default')
+    conf = context.get('dag_run').conf or {}
+
+    # ── Ambil konfigurasi dari frontend ──────────────────────────
+    input_table  = conf.get('input_table')   # e.g. "staging.subway"
+    output_name  = conf.get('output_name')   # e.g. "subway_clean"
+    transforms   = conf.get('transforms', [])
+    workflow_id  = conf.get('workflow_id', 'manual')
+    force        = conf.get('force', False)
+
+    if not input_table:
+        raise ValueError(
+            "input_table tidak ada di conf. "
+            "Jalankan pipeline dari frontend atau kirim conf dengan input_table."
+        )
+
+    # ── Pastikan tabel source ada ─────────────────────────────────
+    if '.' not in input_table:
+        input_table = f'staging.{input_table}'
+
+    parts = input_table.split('.')
+    schema_name, tbl_name = parts
+
+    schema_name, tbl_name = parts
+    exists = pg.get_first(f"""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_schema = '{schema_name}'
+            AND table_name = '{tbl_name}'
+        )
+    """)[0]
+    if not exists:
+        raise ValueError(f"Tabel {input_table} tidak ditemukan di database")
+
+    # ── Ambil schema dari tabel ───────────────────────────────────
+    schema = get_schema_from_table(pg, input_table)
+    if not schema:
+        raise ValueError(f"Tidak ada kolom yang ditemukan di {input_table}")
+
+    row_count = pg.get_first(f'SELECT COUNT(*) FROM {input_table}')[0]
+    print(f'Input table: {input_table}')
+    print(f'Schema: {schema}')
+    print(f'Row count: {row_count}')
+    print(f'Transforms: {len(transforms)} steps')
+    print(f'Output: warehouse.{output_name}')
+
+    # ── Push ke XCom untuk task berikutnya ───────────────────────
+    context['ti'].xcom_push(key='input_table',  value=input_table)
+    context['ti'].xcom_push(key='output_name',  value=output_name or 'output_default')
+    context['ti'].xcom_push(key='schema',       value=json.dumps(schema))
+    context['ti'].xcom_push(key='transforms',   value=json.dumps(transforms))
+    context['ti'].xcom_push(key='row_count',    value=row_count)
+    context['ti'].xcom_push(key='workflow_id',  value=workflow_id)
+
+    print(f'Extract selesai: {row_count} rows dari {input_table}')
+
+
+def transform(**context):
+    """
+    Terapkan transformasi dari workflow frontend ke data.
+    """
+    pg = PostgresHook(postgres_conn_id='postgres_default')
+    ti = context['ti']
+
+    input_table  = ti.xcom_pull(key='input_table',  task_ids='extract')
+    schema_json  = ti.xcom_pull(key='schema',        task_ids='extract')
+    transforms_j = ti.xcom_pull(key='transforms',    task_ids='extract')
+
+    if not input_table or not schema_json:
+        raise ValueError('Data dari task extract tidak ditemukan di XCom')
+
+    schema     = json.loads(schema_json)
+    transforms = json.loads(transforms_j) if transforms_j else []
+
+    # Bersihkan temp tables dari run sebelumnya
+    existing_temps = pg.get_records("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'staging'
+        AND table_name LIKE '_transform_step_%'
+    """)
+    for (tbl,) in existing_temps:
+        pg.run(f'DROP TABLE IF EXISTS staging."{tbl}"')
+
+    # Terapkan semua transformasi
+    final_table = apply_transforms(pg, input_table, transforms, schema)
+
+    # Push hasil ke XCom
+    ti.xcom_push(key='transformed_table', value=final_table)
+
+    # Ambil schema final (mungkin berubah setelah transform)
+    final_schema = get_schema_from_table(pg, final_table) if '.' in final_table else schema
+    ti.xcom_push(key='final_schema', value=json.dumps(final_schema))
+
+    count = pg.get_first(f'SELECT COUNT(*) FROM {final_table}')[0]
+    print(f'Transform selesai: {count} rows di {final_table}')
+
+
+def load(**context):
+    """
+    Load hasil transform ke warehouse dengan nama yang dikonfigurasi frontend.
+    """
+    pg = PostgresHook(postgres_conn_id='postgres_default')
+    ti = context['ti']
+
+    output_name       = ti.xcom_pull(key='output_name',       task_ids='extract')
+    transformed_table = ti.xcom_pull(key='transformed_table', task_ids='transform')
+    final_schema_json = ti.xcom_pull(key='final_schema',      task_ids='transform')
+    schema_json       = ti.xcom_pull(key='schema',            task_ids='extract')
+
+    if not transformed_table:
+        raise ValueError('transformed_table tidak ditemukan di XCom')
+
+    # Gunakan final_schema kalau ada, fallback ke schema awal
+    schema = json.loads(final_schema_json or schema_json or '{}')
+    if not schema:
+        raise ValueError('Schema tidak ditemukan')
+
+    # Pastikan schema warehouse ada
+    pg.run("CREATE SCHEMA IF NOT EXISTS warehouse")
+
+    # Nama tabel output di warehouse
+    safe_output = output_name.lower().replace(' ', '_').replace('-', '_')
+    output_table = f'warehouse.{safe_output}'
+
+    # Buat atau update tabel output
+    extra_cols = [
+        'loaded_at      TIMESTAMP DEFAULT NOW()',
+        'date_partition DATE      DEFAULT CURRENT_DATE',
+    ]
+    sync_table_schema(pg, output_table, schema, extra_cols=extra_cols)
+
+    # Insert data
+    col_names = ', '.join([f'"{c}"' for c in schema.keys()])
+    pg.run(f"""
+        INSERT INTO {output_table} ({col_names}, date_partition, loaded_at)
+        SELECT {col_names}, CURRENT_DATE, NOW()
+        FROM {transformed_table}
+    """)
+
+    count = pg.get_first(f'SELECT COUNT(*) FROM {output_table}')[0]
+    print(f'Load selesai: {count} rows → {output_table}')
+
+    # Simpan info ke meta
+    pg.run("CREATE SCHEMA IF NOT EXISTS meta")
+    pg.run("""
+        CREATE TABLE IF NOT EXISTS meta.pipeline_runs (
+            id           SERIAL PRIMARY KEY,
+            output_table TEXT,
+            row_count    INTEGER,
+            workflow_id  TEXT,
+            ran_at       TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    workflow_id = ti.xcom_pull(key='workflow_id', task_ids='extract') or 'manual'
+    pg.run(f"""
+        INSERT INTO meta.pipeline_runs (output_table, row_count, workflow_id)
+        VALUES ('{output_table}', {count}, '{workflow_id}')
+    """)
+
+    # Bersihkan temp tables
+    temps = pg.get_records("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'staging'
+        AND table_name LIKE '_transform_step_%'
+    """)
+    for (tbl,) in temps:
+        pg.run(f'DROP TABLE IF EXISTS staging."{tbl}"')
+        print(f'Temp table staging.{tbl} dihapus')
+
+    print(f'Pipeline selesai! Data tersedia di {output_table}')
+
+
+# ── DAG Definition ─────────────────────────────────────────────────────────────
+
+with DAG(
+    dag_id='etl_pipeline',
+    default_args=default_args,
+    schedule_interval=None,   # Hanya trigger manual dari frontend
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=['etl', 'dynamic'],
+) as dag:
+
+    t_extract   = PythonOperator(task_id='extract',   python_callable=extract)
+    t_transform = PythonOperator(task_id='transform', python_callable=transform)
+    t_load      = PythonOperator(task_id='load',      python_callable=load)
+
+    t_extract >> t_transform >> t_load

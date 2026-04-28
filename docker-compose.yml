@@ -1,0 +1,145 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  env_file: .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__API__ACCESS_CONTROL_ALLOW_ORIGINS: '*'
+    AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
+    AIRFLOW_CONN_POSTGRES_DEFAULT: 'postgresql://airflow:airflow@postgres:5432/airflow'
+    JAVA_HOME: /usr/lib/jvm/default-java
+    SPARK_HOME: /opt/spark
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark-jobs:/opt/airflow/spark-jobs
+    - ./data_csv:/opt/airflow/data_csv
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+
+# ── FastAPI Backend ───────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - '8000:8000'
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      AIRFLOW_URL: http://airflow-webserver:8080
+      DAGS_FOLDER: /opt/airflow/dags 
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data_csv:/data_csv
+      - ./dags:/opt/airflow/dags 
+    restart: unless-stopped
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    env_file: .env
+    ports:
+      - '${POSTGRES_PORT}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', '${POSTGRES_USER}']
+      interval: 5s
+      retries: 5
+
+  # ── Airflow Init ─────────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c 'airflow db init &&
+      airflow users create --username admin --password admin
+      --firstname Admin --lastname User --role Admin
+      --email admin@example.com'
+    restart: 'no'
+
+  # ── Airflow Webserver ────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - '8080:8080'
+    restart: unless-stopped
+
+  # ── Airflow Scheduler ────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+
+  # ── Apache Spark Master ──────────────────────────────────────────────────────
+  spark:
+    image: apache/spark:3.5.3
+    user: root
+    environment:
+      SPARK_MODE: master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - '8181:8080'
+      - '7077:7077'
+
+  # ── Spark Worker ─────────────────────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.3
+    user: root
+    environment:
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
+    depends_on: [spark]
+
+  # ── Metabase ─────────────────────────────────────────────────────────────────
+  metabase:
+    image: metabase/metabase:latest
+    ports:
+      - '3000:3000'
+    env_file: .env
+    environment:
+      MB_DB_HOST: postgres
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${POSTGRES_USER}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Pipeline Studio (Nginx reverse proxy + frontend) ─────────────────────────
+  #   Serves the React frontend on port 5173
+  #   Proxies /airflow-api → Airflow REST API (port 8080)
+  #   Proxies /metabase    → Metabase         (port 3000)
+  pipeline-studio:
+    image: nginx:alpine
+    ports:
+      - '5173:80'
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - airflow-webserver
+      - metabase
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  airflow_logs:
