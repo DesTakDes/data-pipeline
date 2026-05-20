@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { UtilityConfigModal } from "./UtilityConfigs";
 import {
   ReactFlow, Background, Controls, MiniMap, addEdge,
@@ -6,48 +6,38 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import axios from "axios";
+import { computeNodeColumns, getUpstreamColumns } from "./NodePropagation";
 
-// ─── API ──────────────────────────────────────────────────────────────────────
 const api = axios.create({ baseURL: "/api" });
-const airflow = axios.create({
-  baseURL: "/airflow-api/api/v1",
-  headers: { Authorization: "Basic " + btoa("admin:admin123") },
-});
 
 const API = {
-  // Datasets
   getDatasets:    ()      => api.get("/datasets").catch(() => ({ data: [] })),
   deleteDataset:  (id)    => api.delete(`/datasets/${id}`),
-  previewDataset: (id, n=5) => api.get(`/datasets/${id}/preview?limit=${n}`),
+  previewDataset: (id, n=50) => api.get(`/datasets/${id}/preview?limit=${n}`),
   uploadDataset:  (file, name) => {
     const f = new FormData(); f.append("file", file);
     if (name) f.append("name", name);
     return api.post("/datasets/upload", f);
   },
-  connectDB: (p) => api.post("/datasets/connect-db", p),
-  // Workflows (stored in localStorage for now, backend optional)
-  getWorkflows:    ()  => { try { return JSON.parse(localStorage.getItem("etl_workflows") || "[]"); } catch { return []; } },
-  saveWorkflow:    (w) => { const ws = API.getWorkflows().filter(x => x.id !== w.id); ws.push(w); localStorage.setItem("etl_workflows", JSON.stringify(ws)); return w; },
-  deleteWorkflow:  (id) => { const ws = API.getWorkflows().filter(x => x.id !== id); localStorage.setItem("etl_workflows", JSON.stringify(ws)); },
-  // Airflow
-  getAirflowStatus: () => axios.get("/airflow-api/health").then(() => ({ data: { connected: true } })).catch(() => ({ data: { connected: false } })),
-  getDagRuns:      (d)      => airflow.get(`/dags/${d}/dagRuns?limit=5&order_by=-execution_date`),
-  triggerDag:      (d, cfg) => airflow.post(`/dags/${d}/dagRuns`, { conf: cfg || {} }),
-  getTaskInstances:(d, r)   => airflow.get(`/dags/${d}/dagRuns/${r}/taskInstances`),
-  getWarehouseTables: ()    => api.get("/warehouse/tables").catch(() => ({ data: [] })),
-  runNewPipeline:    (payload) => api.post("/pipelines/run", payload),
-  getPipelineRuns:   ()        => api.get("/pipelines/runs").catch(() => ({ data: [] })),
-  previewPipelineRun:(id)      => api.get(`/pipelines/runs/${id}/preview`),
-  getDagStatus:      (id)      => api.get(`/pipelines/runs/${id}/dag-status`),
-  updatePipelineRun: (id, data)=> api.patch(`/pipelines/runs/${id}`, data),
+  connectDB:      (p) => api.post("/datasets/connect-db", p),
+  previewTransform:(payload) => api.post("/preview/transform", payload),
+  getWorkflows:   ()  => { try { return JSON.parse(localStorage.getItem("etl_workflows_v2") || "[]"); } catch { return []; } },
+  saveWorkflow:   (w) => { const ws = API.getWorkflows().filter(x => x.id !== w.id); ws.push(w); localStorage.setItem("etl_workflows_v2", JSON.stringify(ws)); return w; },
+  deleteWorkflow: (id)=> { const ws = API.getWorkflows().filter(x => x.id !== id); localStorage.setItem("etl_workflows_v2", JSON.stringify(ws)); },
+  getWarehouseTables: () => api.get("/warehouse/tables").catch(() => ({ data: [] })),
+  runPipeline:    (payload) => api.post("/pipelines/run", payload),
+  getPipelineRuns:()       => api.get("/pipelines/runs").catch(() => ({ data: [] })),
+  previewRun:     (id)     => api.get(`/pipelines/runs/${id}/preview`),
+  getDagStatus:   (id)     => api.get(`/pipelines/runs/${id}/dag-status`),
+  downloadRun:    (id, fmt)=> `/api/pipelines/runs/${id}/download?format=${fmt}`,
 };
 
-// ─── Colors ───────────────────────────────────────────────────────────────────
 const C = {
   navy:"#0B1E3D", navyMid:"#122850", navyLight:"#1A3A6B",
   blue:"#1D6FEB", blueMid:"#3B82F6", blueLight:"#93C5FD",
   blueTint:"#EFF6FF", blueTint2:"#DBEAFE",
   gold:"#F59E0B", goldTint:"#FFFBEB",
+  spark:"#E25822", sparkTint:"#FFF0EC",
   white:"#FFFFFF", off:"#F8FAFC",
   g50:"#F8FAFC", g100:"#F1F5F9", g200:"#E2E8F0",
   g300:"#CBD5E1", g400:"#94A3B8", g500:"#64748B", g600:"#475569", g700:"#334155",
@@ -56,39 +46,37 @@ const C = {
   orange:"#EA580C",
 };
 
-// ─── Icons ────────────────────────────────────────────────────────────────────
 const Ic = {
-  DB:      () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>,
-  Chart:   () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 17l3-4 3 3 3-5"/></svg>,
-  Flow:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="9" y="15" width="6" height="6" rx="1"/><path d="M6 9v3a3 3 0 003 3h6a3 3 0 003-3V9"/></svg>,
-  Upload:  () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
-  Plus:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
-  Search:  () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="15" height="15"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
-  Trash:   () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg>,
-  Copy:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>,
-  Link:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>,
-  Play:    () => <svg viewBox="0 0 24 24" fill="currentColor" width="13" height="13"><polygon points="5 3 19 12 5 21 5 3"/></svg>,
-  X:       () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
-  Eye:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
-  Refresh: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>,
-  Edit:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
-  Warn:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>,
-  Menu:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>,
-  Table:   () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>,
+  DB:       () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>,
+  Chart:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 17l3-4 3 3 3-5"/></svg>,
+  Flow:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="9" y="15" width="6" height="6" rx="1"/><path d="M6 9v3a3 3 0 003 3h6a3 3 0 003-3V9"/></svg>,
+  Upload:   () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
+  Plus:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="15" height="15"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+  Search:   () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="15" height="15"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
+  Trash:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg>,
+  Copy:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>,
+  Eye:      () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
+  Edit:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+  Play:     () => <svg viewBox="0 0 24 24" fill="currentColor" width="13" height="13"><polygon points="5 3 19 12 5 21 5 3"/></svg>,
+  X:        () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+  Refresh:  () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>,
+  Download: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+  Save:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>,
+  Back:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>,
+  Link:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>,
+  Spark:    () => <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>,
+  Menu:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>,
   ArrowRight: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>,
-  Save:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>,
-  Back:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>,
-  InData:  () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
-  OutData: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
+  Branch:   () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><circle cx="6" cy="3" r="2"/><circle cx="6" cy="21" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 5v14M6 5c3.3 0 10.5 2 10.5 4"/></svg>,
 };
 
-// ─── Node Palette ─────────────────────────────────────────────────────────────
+// Node palette
 const NODE_PALETTE = {
   datasets: {
     label: "Datasets", color: C.blue,
     items: [
-      { label: "Input Dataset",  type: "input_dataset",  desc: "Source data" },
-      { label: "Output Dataset", type: "output_dataset", desc: "Save result" },
+      { label: "Input Dataset",  type: "input_dataset" },
+      { label: "Output Dataset", type: "output_dataset" },
     ],
   },
   utility: {
@@ -111,109 +99,102 @@ const NODE_PALETTE = {
   },
 };
 
-const NODE_STYLE = {
-  input_dataset:  { bg: C.blue,      text: "Source" },
-  output_dataset: { bg: C.green,     text: "Output" },
-  filter_rows:    { bg: C.blueMid,   text: "Filter" },
-  fill_null:      { bg: C.blueMid,   text: "Fill" },
-  group_agg:      { bg: C.navyLight, text: "Agg" },
-  join_data:      { bg: C.blue,      text: "Join" },
-  pyspark:        { bg: C.orange,    text: "Spark" },
-  drop_col:       { bg: C.red,       text: "Drop" },
-  default:        { bg: C.gold,      text: "Util" },
+const NODE_BG = {
+  input_dataset: C.blue, output_dataset: C.green,
+  filter_rows: C.blueMid, fill_null: C.blueMid,
+  group_agg: C.navyLight, join_data: C.blue,
+  pyspark: C.spark, drop_col: C.red, default: C.gold,
 };
-const nStyle = (type) => NODE_STYLE[type] || NODE_STYLE.default;
+const nodeBg = (type) => NODE_BG[type] || NODE_BG.default;
 
-// ─── Custom Node ──────────────────────────────────────────────────────────────
+// ── ETL Node ──────────────────────────────────────────────────────────────────
 function ETLNode({ id, data }) {
-  const { bg } = nStyle(data.type);
+  const bg      = nodeBg(data.type);
   const isInput  = data.type === "input_dataset";
   const isOutput = data.type === "output_dataset";
+  const isUtil   = !isInput && !isOutput;
+  const upCols   = data.upstreamColumns || [];
+  const outCols  = data.outputColumns   || [];
+  const connected= data.isConnected || false;
+  const configured = data.config && (
+    isInput ? !!data.config.dataset :
+    isOutput ? !!data.config.outputName :
+    Object.keys(data.config).length > 0
+  );
 
   return (
-    <div style={{ background: C.white, border: `2px solid ${bg}`, borderRadius: 10, minWidth: 180, boxShadow: `0 4px 16px ${bg}22`, fontFamily: "'DM Sans',sans-serif", overflow: "hidden" }}>
+    <div style={{
+      background: C.white, border: `2px solid ${bg}`, borderRadius: 10,
+      minWidth: 200, maxWidth: 260, boxShadow: `0 4px 16px ${bg}22`,
+      fontFamily: "'DM Sans',sans-serif", overflow: "hidden",
+    }}>
       {!isInput  && <Handle type="target" position={Position.Left}  style={{ background: bg, width: 10, height: 10, border: `2px solid ${C.white}` }} />}
       {!isOutput && <Handle type="source" position={Position.Right} style={{ background: bg, width: 10, height: 10, border: `2px solid ${C.white}` }} />}
 
       {/* Header */}
-      <div style={{ background: bg, padding: "6px 10px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <span style={{ color: C.white, fontSize: 11, fontWeight: 700 }}>
-          {isInput ? "📥 " : isOutput ? "📤 " : ""}{data.label}
+      <div style={{ background: bg, padding: "6px 8px", display: "flex", alignItems: "center", gap: 4 }}>
+        <span style={{ color: C.white, fontSize: 11, fontWeight: 700, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {isInput ? "📥 " : isOutput ? "📤 " : data.type === "pyspark" ? "⚡ " : ""}{data.label}
         </span>
-        <div style={{ display: "flex", gap: 3 }}>
-          <button onClick={() => data.onDuplicate(id)} title="Duplicate" style={{ background: "rgba(255,255,255,0.2)", border: "none", borderRadius: 4, width: 20, height: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: C.white }}><Ic.Copy /></button>
-          <button onClick={() => data.onDelete(id)}    title="Delete"    style={{ background: "rgba(255,255,255,0.2)", border: "none", borderRadius: 4, width: 20, height: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: C.white }}><Ic.Trash /></button>
-        </div>
+        <button onClick={() => data.onPreview(id)} title="Preview" style={{ background: "rgba(255,255,255,0.18)", border: "none", borderRadius: 4, width: 20, height: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: C.white, flexShrink: 0 }}><Ic.Eye /></button>
+        <button onClick={() => data.onDuplicate(id)} title="Duplicate" style={{ background: "rgba(255,255,255,0.18)", border: "none", borderRadius: 4, width: 20, height: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: C.white, flexShrink: 0 }}><Ic.Copy /></button>
+        <button onClick={() => data.onDelete(id)} title="Delete" style={{ background: "rgba(255,255,255,0.18)", border: "none", borderRadius: 4, width: 20, height: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: C.white, flexShrink: 0 }}><Ic.Trash /></button>
       </div>
 
       {/* Body */}
       <div style={{ padding: "8px 10px" }}>
         {isInput && (
-          <div>
-            {data.config?.dataset ? (
-              <div style={{ background: C.blueTint, borderRadius: 6, padding: "5px 8px" }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: C.blue }}>{data.config.dataset.name}</div>
-                <div style={{ fontSize: 9, color: C.g400 }}>{data.config.dataset.row_count?.toLocaleString()} rows</div>
+          data.config?.dataset ? (
+            <div>
+              <div style={{ background: C.blueTint, borderRadius: 6, padding: "5px 8px", marginBottom: 6 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: C.blue, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{data.config.dataset.name}</div>
+                <div style={{ fontSize: 9, color: C.g400 }}>{data.config.dataset.row_count?.toLocaleString() || "?"} rows · {outCols.length} cols</div>
+                {data.config.dataset.is_large && <div style={{ fontSize: 9, color: C.spark, fontWeight: 700 }}>⚡ Large file → Parquet</div>}
               </div>
-            ) : (
-              <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "5px 0", borderRadius: 6, border: `1px dashed ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                + Select Dataset
-              </button>
-            )}
-          </div>
+              <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "3px 0", borderRadius: 5, border: `1px solid ${C.blue}44`, background: "none", color: C.blue, fontSize: 10, cursor: "pointer" }}>✎ Change Dataset</button>
+            </div>
+          ) : (
+            <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "6px 0", borderRadius: 6, border: `1px dashed ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>+ Select Dataset</button>
+          )
         )}
 
         {isOutput && (
-          <div>
-            {data.config?.outputName ? (
-              <div style={{ background: C.greenTint, borderRadius: 6, padding: "5px 8px" }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: C.green }}>{data.config.outputName}</div>
-                <div style={{ fontSize: 9, color: C.g400 }}>{data.config.description || "No description"}</div>
+          data.config?.outputName ? (
+            <div>
+              <div style={{ background: C.greenTint, borderRadius: 6, padding: "5px 8px", marginBottom: 6 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: C.green }}>warehouse.{data.config.outputName}</div>
+                <div style={{ fontSize: 9, color: C.g400 }}>{upCols.length} cols from upstream</div>
+                {data.config.taskId && <div style={{ fontSize: 9, color: C.g500 }}>Task: {data.config.taskId}</div>}
               </div>
-            ) : (
-              <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "5px 0", borderRadius: 6, border: `1px dashed ${C.green}`, background: C.greenTint, color: C.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                + Configure Output
-              </button>
-            )}
-          </div>
+              <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "3px 0", borderRadius: 5, border: `1px solid ${C.green}44`, background: "none", color: C.green, fontSize: 10, cursor: "pointer" }}>✎ Edit Output</button>
+            </div>
+          ) : (
+            <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "6px 0", borderRadius: 6, border: `1px dashed ${C.green}`, background: C.greenTint, color: C.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>+ Configure Output</button>
+          )
         )}
 
-        {data.type === "filter_rows" && (
-          <input defaultValue={data.config?.condition || ""} onChange={e => data.onConfig(id, { condition: e.target.value })}
-            placeholder="e.g. age > 18" style={{ width: "100%", padding: "4px 6px", borderRadius: 5, border: `1px solid ${C.g200}`, fontSize: 11, boxSizing: "border-box", color: C.g700 }} />
-        )}
-
-        {data.type === "pyspark" && (
-          <textarea defaultValue={data.config?.code || ""} onChange={e => data.onConfig(id, { code: e.target.value })}
-            placeholder="# PySpark code..." style={{ width: "100%", height: 60, padding: "4px 6px", borderRadius: 5, border: `1px solid ${C.g200}`, fontSize: 10, fontFamily: "monospace", resize: "none", boxSizing: "border-box", color: C.g700 }} />
-        )}
-
-        {data.type === "group_agg" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            <select onChange={e => data.onConfig(id, { ...data.config, groupBy: e.target.value })}
-              style={{ padding: "3px 5px", borderRadius: 5, border: `1px solid ${C.g200}`, fontSize: 11, color: C.g700 }}>
-              <option value="">Group by...</option>
-              {(data.columns || []).map(c => <option key={c}>{c}</option>)}
-            </select>
-            <select onChange={e => data.onConfig(id, { ...data.config, agg: e.target.value })}
-              style={{ padding: "3px 5px", borderRadius: 5, border: `1px solid ${C.g200}`, fontSize: 11, color: C.g700 }}>
-              <option>COUNT(*)</option><option>SUM</option><option>AVG</option><option>MAX</option><option>MIN</option>
-            </select>
-          </div>
-        )}
-
-        {!["input_dataset","output_dataset","filter_rows","pyspark","group_agg"].includes(data.type) && (
-          <div>
-            {data.config && Object.keys(data.config).length > 0 ? (
-              <div style={{ background: "#DCFCE7", borderRadius: 6, padding: "4px 8px", fontSize: 10, color: "#16A34A", fontWeight: 600 }}>
-                ✓ Configured — click to edit
+        {isUtil && (
+          !connected ? (
+            <div style={{ fontSize: 10, color: C.g400, textAlign: "center", padding: "4px 0", fontStyle: "italic" }}>← Connect to upstream node</div>
+          ) : !configured ? (
+            <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "5px 0", borderRadius: 6, border: `1px dashed ${C.gold}`, background: C.goldTint, color: C.gold, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>+ Configure ({upCols.length} cols)</button>
+          ) : (
+            <div>
+              <div style={{ background: C.greenTint, borderRadius: 5, padding: "3px 7px", marginBottom: 4, fontSize: 10, color: C.green, fontWeight: 600, display: "flex", justifyContent: "space-between" }}>
+                <span>✓ Configured</span>
+                <button onClick={() => data.onConfigure(id)} style={{ background: "none", border: "none", cursor: "pointer", color: C.green, fontSize: 10, padding: 0 }}>✎ Edit</button>
               </div>
-            ) : (
-              <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "4px 0", borderRadius: 6, border: "1px dashed #F59E0B", background: "#FFFBEB", color: "#F59E0B", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                + Configure
-              </button>
-            )}
-          </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: C.g400, marginBottom: 3 }}>
+                <span>In: {upCols.length}</span><span>→</span><span>Out: {outCols.length}</span>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 2 }}>
+                {outCols.slice(0, 5).map(c => (
+                  <span key={c} style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: C.blueTint2, color: C.blue, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>
+                ))}
+                {outCols.length > 5 && <span style={{ fontSize: 8, color: C.g400 }}>+{outCols.length - 5}</span>}
+              </div>
+            </div>
+          )
         )}
       </div>
     </div>
@@ -222,173 +203,368 @@ function ETLNode({ id, data }) {
 
 const nodeTypes = { etlNode: ETLNode };
 
-// ─── Toast ────────────────────────────────────────────────────────────────────
-function Toast({ toasts }) {
-  return (
-    <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 9999, display: "flex", flexDirection: "column", gap: 8, pointerEvents: "none" }}>
-      {toasts.map(t => (
-        <div key={t.id} style={{ padding: "10px 18px", borderRadius: 10, fontSize: 13, fontWeight: 600, background: t.type === "success" ? C.green : t.type === "error" ? C.red : C.blue, color: C.white, boxShadow: "0 4px 16px rgba(0,0,0,0.18)", animation: "slideIn .2s ease" }}>{t.msg}</div>
-      ))}
-    </div>
-  );
-}
+// ── Preview Panel ─────────────────────────────────────────────────────────────
+function NodePreviewPanel({ node, datasets, edges, nodes, onClose }) {
+  const [loading, setLoading] = useState(false);
+  const [data, setData]       = useState(null);
+  const [error, setError]     = useState(null);
 
-// ─── Modal ────────────────────────────────────────────────────────────────────
-function Modal({ title, onClose, children, width = 480 }) {
+  const isInput  = node?.data?.type === "input_dataset";
+  const isOutput = node?.data?.type === "output_dataset";
+  const dsId = node?.data?.config?.dataset?.id;
+
+  useEffect(() => {
+    if (!node) return;
+    if (isInput && dsId) {
+      setLoading(true);
+      API.previewDataset(dsId, 50)
+        .then(r => setData(r.data))
+        .catch(() => setError("Could not load preview"))
+        .finally(() => setLoading(false));
+    } else if (!isInput && !isOutput) {
+      // Find source dataset
+      const colMap = computeNodeColumns(nodes, edges);
+      const sourceEdge = edges.find(e => e.target === node.id);
+      if (!sourceEdge) {
+        setData({ columns: [], rows: [], info: "Connect to upstream node first" });
+        return;
+      }
+      // Trace back to input dataset
+      const inputNode = nodes.find(n => n.data?.type === "input_dataset" && n.data?.config?.dataset?.id);
+      if (!inputNode) {
+        setData({ columns: colMap[node.id] || [], rows: [], info: "No input dataset connected" });
+        return;
+      }
+      // Build transform chain up to this node
+      const chain = buildTransformChain(node.id, nodes, edges);
+      setLoading(true);
+      API.previewTransform({
+        dataset_id: inputNode.data.config.dataset.id,
+        transforms: chain,
+        limit: 50,
+      })
+        .then(r => setData(r.data))
+        .catch(e => setData({ columns: colMap[node.id] || [], rows: [], info: "Preview needs connected pipeline" }))
+        .finally(() => setLoading(false));
+    } else {
+      setData({ columns: [], rows: [] });
+    }
+  }, [node?.id]);
+
+  const downloadCSV = () => {
+    if (!data?.rows?.length) return;
+    const h = data.columns.join(",");
+    const b = data.rows.map(r => data.columns.map(c => {
+      const v = r[c]; if (v == null) return "";
+      const s = String(v);
+      return s.includes(",") || s.includes('"') ? `"${s.replace(/"/g,'""')}"` : s;
+    }).join(",")).join("\n");
+    const blob = new Blob([h + "\n" + b], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = `${node.data.label}_preview.csv`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  if (!node) return null;
+  const bg = nodeBg(node.data?.type);
+
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(11,30,61,.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={onClose}>
-      <div style={{ background: C.white, borderRadius: 16, width, maxWidth: "92vw", boxShadow: "0 24px 64px rgba(0,0,0,.22)", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
-        <div style={{ background: `linear-gradient(90deg,${C.navy},${C.navyLight})`, padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ color: C.white, fontWeight: 800, fontSize: 15 }}>{title}</span>
-          <button onClick={onClose} style={{ background: "rgba(255,255,255,.1)", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", color: C.white }}><Ic.X /></button>
+    <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: 480, background: C.white, borderLeft: `1px solid ${C.g200}`, display: "flex", flexDirection: "column", zIndex: 50, boxShadow: "-4px 0 24px rgba(0,0,0,0.10)", fontFamily: "'DM Sans',sans-serif" }}>
+      <div style={{ background: `linear-gradient(90deg,${C.navy},${bg}33)`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+        <div>
+          <div style={{ color: C.white, fontWeight: 800, fontSize: 14 }}>{node.data?.label}</div>
+          <div style={{ color: "rgba(255,255,255,0.6)", fontSize: 10 }}>{data?.columns?.length || 0} cols · {data?.rows?.length || 0} rows preview</div>
         </div>
-        <div style={{ padding: 22 }}>{children}</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {data?.rows?.length > 0 && <button onClick={downloadCSV} style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 10px", borderRadius: 6, background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.2)", color: C.white, fontSize: 11, fontWeight: 700, cursor: "pointer" }}><Ic.Download /> CSV</button>}
+          <button onClick={onClose} style={{ background: "rgba(255,255,255,0.1)", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", color: C.white, fontSize: 16 }}>×</button>
+        </div>
+      </div>
+
+      {/* Column chips */}
+      {data?.columns?.length > 0 && (
+        <div style={{ padding: "8px 14px", borderBottom: `1px solid ${C.g200}`, background: C.g50, flexShrink: 0 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.g400, textTransform: "uppercase", letterSpacing: 1, marginBottom: 5 }}>Columns ({data.columns.length})</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, maxHeight: 72, overflowY: "auto" }}>
+            {data.columns.map(c => <span key={c} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: C.blueTint2, color: C.blue, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>)}
+          </div>
+        </div>
+      )}
+
+      <div style={{ flex: 1, overflow: "auto" }}>
+        {loading && <div style={{ padding: 40, textAlign: "center", color: C.g400 }}>Loading preview…</div>}
+        {error && <div style={{ padding: 20 }}><div style={{ background: C.redTint, borderRadius: 8, padding: 12, fontSize: 12, color: C.red }}>{error}</div></div>}
+        {data?.info && !loading && <div style={{ padding: 20, textAlign: "center", color: C.g400, fontSize: 12 }}>{data.info}</div>}
+        {data?.rows?.length > 0 && !loading && (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+            <thead><tr style={{ background: C.g50, position: "sticky", top: 0 }}>
+              <th style={{ padding: "5px 8px", color: C.g400, fontWeight: 600, borderBottom: `1px solid ${C.g200}`, fontSize: 9 }}>#</th>
+              {data.columns.map(c => <th key={c} style={{ padding: "5px 8px", textAlign: "left", fontWeight: 700, color: C.g600, borderBottom: `2px solid ${C.g200}`, whiteSpace: "nowrap", fontFamily: "monospace" }}>{c}</th>)}
+            </tr></thead>
+            <tbody>
+              {data.rows.map((row, i) => (
+                <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.g50 }}>
+                  <td style={{ padding: "4px 8px", color: C.g300, fontSize: 9, textAlign: "center", borderBottom: `1px solid ${C.g100}` }}>{i+1}</td>
+                  {data.columns.map(c => (
+                    <td key={c} style={{ padding: "4px 8px", borderBottom: `1px solid ${C.g100}`, color: row[c] == null ? C.g300 : C.g700, fontStyle: row[c] == null ? "italic" : "normal", whiteSpace: "nowrap", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {row[c] == null ? "null" : String(row[c])}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {!loading && !error && (!data || data.rows?.length === 0) && !data?.info && (
+          <div style={{ padding: 40, textAlign: "center", color: C.g400 }}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>📭</div>
+            <div>No data or node not configured</div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-// ─── Workflow Editor (ReactFlow canvas) ───────────────────────────────────────
+// Build transform chain from root to a given node
+function buildTransformChain(targetNodeId, nodes, edges) {
+  // Trace path from input to target
+  const path = [];
+  let current = targetNodeId;
+  while (current) {
+    const node = nodes.find(n => n.id === current);
+    if (!node) break;
+    if (node.data.type !== "input_dataset") {
+      path.unshift({ type: node.data.type, config: node.data.config || {} });
+    }
+    const sourceEdge = edges.find(e => e.target === current);
+    current = sourceEdge?.source;
+    if (node.data.type === "input_dataset") break;
+  }
+  return path;
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function Toast({ toasts }) {
+  return (
+    <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 9999, display: "flex", flexDirection: "column", gap: 8, pointerEvents: "none" }}>
+      {toasts.map(t => (
+        <div key={t.id} style={{ padding: "10px 18px", borderRadius: 10, fontSize: 13, fontWeight: 600, background: t.type === "success" ? C.green : t.type === "error" ? C.red : C.blue, color: C.white, boxShadow: "0 4px 16px rgba(0,0,0,0.18)" }}>{t.msg}</div>
+      ))}
+    </div>
+  );
+}
+
+function Modal({ title, onClose, children, width = 480 }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(11,30,61,.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={onClose}>
+      <div style={{ background: C.white, borderRadius: 16, width, maxWidth: "92vw", maxHeight: "90vh", boxShadow: "0 24px 64px rgba(0,0,0,.22)", overflow: "hidden", display: "flex", flexDirection: "column" }} onClick={e => e.stopPropagation()}>
+        <div style={{ background: `linear-gradient(90deg,${C.navy},${C.navyLight})`, padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+          <span style={{ color: C.white, fontWeight: 800, fontSize: 15 }}>{title}</span>
+          <button onClick={onClose} style={{ background: "rgba(255,255,255,.1)", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", color: C.white }}><Ic.X /></button>
+        </div>
+        <div style={{ padding: 22, overflowY: "auto" }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── Workflow Editor ────────────────────────────────────────────────────────────
 function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const [nodes, setNodes, onNodesChange] = useNodesState(workflow.nodes || []);
   const [edges, setEdges, onEdgesChange] = useEdgesState(workflow.edges || []);
-  const [wfTab, setWfTab]   = useState("datasets");
-  const [counter, setCounter] = useState(100);
-  const [running, setRunning] = useState(false);
+  const [wfTab, setWfTab]       = useState("datasets");
+  const [counter, setCounter]   = useState(100);
+  const [running, setRunning]   = useState(false);
   const [dagStatus, setDagStatus] = useState(null);
   const [taskStates, setTaskStates] = useState({});
-  const [configModal, setConfigModal] = useState(null); // { nodeId, type }
-  const [utilConfigNode, setUtilConfigNode] = useState(null); // for utility nodes
-  const [inputConfig, setInputConfig]  = useState({ datasetId: "" });
-  const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "" });
+  const [configModal, setConfigModal] = useState(null);
+  const [utilNode, setUtilNode] = useState(null);
+  const [previewNode, setPreviewNode] = useState(null);
+  const [inputConfig, setInputConfig] = useState({ datasetId: "" });
+  const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "task_1" });
+  const pollRef = useRef(null);
+
+  // Column propagation
+  const columnMap = useMemo(() => computeNodeColumns(nodes, edges), [nodes, edges]);
+
+  useEffect(() => {
+    setNodes(ns => {
+      let hasChanges = false; // <-- Penanda apakah ada perubahan
+      
+      const newNodes = ns.map(n => {
+        const sourceEdge = edges.find(e => e.target === n.id);
+        const upstreamCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
+        const outputCols   = columnMap[n.id] || [];
+        const isConnected  = edges.some(e => e.target === n.id);
+        
+        if (
+          JSON.stringify(n.data.upstreamColumns) !== JSON.stringify(upstreamCols) ||
+          JSON.stringify(n.data.outputColumns) !== JSON.stringify(outputCols) ||
+          n.data.isConnected !== isConnected
+        ) {
+          hasChanges = true; // <-- Tandai bahwa ada perubahan
+          return { ...n, data: { ...n.data, upstreamColumns: upstreamCols, outputColumns: outputCols, isConnected } };
+        }
+        return n;
+      });
+
+      // PENTING: Jika tidak ada yang berubah, kembalikan array 'ns' lama untuk MENCEGAH INFINITE LOOP
+      return hasChanges ? newNodes : ns; 
+    });
+  }, [columnMap, edges, setNodes]);
+  
+  const buildCallbacks = useCallback(() => ({
+    onDelete:    (nid) => setNodes(ns => ns.filter(n => n.id !== nid)),
+    onDuplicate: (nid) => setNodes(ns => {
+      const o = ns.find(n => n.id === nid); if (!o) return ns;
+      return [...ns, { ...o, id: `n${Date.now()}`, position: { x: o.position.x + 30, y: o.position.y + 30 } }];
+    }),
+    onConfigure: (nid) => setNodes(ns => {
+      const n = ns.find(x => x.id === nid); if (!n) return ns;
+      const isIO = ["input_dataset","output_dataset"].includes(n.data.type);
+      if (isIO) {
+        if (n.data.type === "output_dataset" && n.data.config?.outputName) {
+          setOutputConfig({ outputName: n.data.config.outputName, description: n.data.config.description || "", taskId: n.data.config.taskId || "task_1" });
+        }
+        setConfigModal({ nodeId: nid, type: n.data.type });
+      } else {
+        setUtilNode(n);
+      }
+      return ns;
+    }),
+    onPreview: (nid) => setNodes(ns => {
+      const n = ns.find(x => x.id === nid);
+      if (n) setPreviewNode(n);
+      return ns;
+    }),
+  }), [setNodes]);
+
+  // Rebuild callbacks on load
+  useEffect(() => {
+    const cbs = buildCallbacks();
+    setNodes(ns => ns.map(n => ({ ...n, data: { ...n.data, ...cbs } })));
+  }, []);
+
+  const addNode = useCallback((item) => {
+    const id  = `n${counter}`;
+    const cbs = buildCallbacks();
+    setCounter(c => c + 1);
+    setNodes(ns => [...ns, {
+      id, type: "etlNode",
+      position: { x: 80 + (counter % 4) * 230, y: 60 + Math.floor(counter / 4) * 180 },
+      data: { label: item.label, type: item.type, config: null, columns: [], upstreamColumns: [], outputColumns: [], isConnected: false, ...cbs },
+    }]);
+  }, [counter, buildCallbacks]);
 
   const onConnect = useCallback(
     p => setEdges(es => addEdge({ ...p, animated: true, style: { stroke: C.blue, strokeWidth: 2 } }, es)),
     [setEdges]
   );
 
-  const makeNodeData = useCallback((label, type, extra = {}) => ({
-    label, type, config: null, columns: [],
-    ...extra,
-    onDelete:    (nid) => setNodes(ns => ns.filter(n => n.id !== nid)),
-    onDuplicate: (nid) => setNodes(ns => {
-      const o = ns.find(n => n.id === nid); if (!o) return ns;
-      return [...ns, { ...o, id: `n${Date.now()}`, position: { x: o.position.x + 30, y: o.position.y + 30 } }];
-    }),
-    onConfig:    (nid, val) => setNodes(ns => ns.map(n => n.id === nid ? { ...n, data: { ...n.data, config: { ...n.data.config, ...val } } } : n)),
-    onConfigure: (nid) => {
-        const isInputOutput = ["input_dataset","output_dataset"].includes(type);
-        if (isInputOutput) { setConfigModal({ nodeId: nid, type }); }
-        else { setNodes(ns => { const n = ns.find(x => x.id === nid); if (n) setUtilConfigNode(n); return ns; }); }
-      },
-  }), [setNodes]);
-
-  const addNode = useCallback((item) => {
-    const id = `n${counter}`;
-    setCounter(c => c + 1);
-    setNodes(ns => [...ns, {
-      id, type: "etlNode",
-      position: { x: 80 + (counter % 5) * 210, y: 60 + Math.floor(counter / 5) * 150 },
-      data: makeNodeData(item.label, item.type),
-    }]);
-  }, [counter, makeNodeData]);
-
-  // Apply dataset config to input node
-  const applyInputConfig = () => {
+  const applyInputConfig = async () => {
     const ds = datasets.find(d => d.id === parseInt(inputConfig.datasetId));
     if (!ds) return;
+    let dsWithCols = ds;
+    if (!ds.columns || ds.columns.length === 0) {
+      try { const r = await API.previewDataset(ds.id, 1); dsWithCols = { ...ds, columns: r.data.columns || [] }; } catch {}
+    }
+    const cbs = buildCallbacks();
     setNodes(ns => ns.map(n => n.id === configModal.nodeId ? {
-      ...n, data: { ...n.data, config: { dataset: ds }, columns: ds.columns || [],
-        onDelete: n.data.onDelete, onDuplicate: n.data.onDuplicate,
-        onConfig: n.data.onConfig, onConfigure: n.data.onConfigure,
-      }
+      ...n, data: { ...n.data, config: { dataset: dsWithCols }, columns: dsWithCols.columns || [], outputColumns: dsWithCols.columns || [], ...cbs }
     } : n));
     setConfigModal(null);
-    toast(`Dataset "${ds.name}" assigned to node`, "success");
+    setInputConfig({ datasetId: "" });
+    toast(`Dataset "${ds.name}" assigned`, "success");
   };
 
-  // Apply output config
-  const applyOutputConfig = async () => {
-    if (!outputConfig.outputName.trim()) return toast("Output name is required", "error");
+  const applyOutputConfig = () => {
+    if (!outputConfig.outputName.trim()) return toast("Output name required", "error");
+    const cbs = buildCallbacks();
     setNodes(ns => ns.map(n => n.id === configModal.nodeId ? {
-      ...n, data: { ...n.data, config: { ...outputConfig },
-        onDelete: n.data.onDelete, onDuplicate: n.data.onDuplicate,
-        onConfig: n.data.onConfig, onConfigure: n.data.onConfigure,
-      }
+      ...n, data: { ...n.data, config: { ...outputConfig }, ...cbs }
     } : n));
     setConfigModal(null);
     toast("Output configured", "success");
   };
 
-  // Save workflow
-  const handleSave = () => {
+  const handleSave = useCallback(() => {
     const serialized = {
       ...workflow,
       nodes: nodes.map(n => ({
         id: n.id, type: n.type, position: n.position,
         data: { label: n.data.label, type: n.data.type, config: n.data.config, columns: n.data.columns },
       })),
-      edges: edges.map(e => ({ id: e.id, source: e.source, target: e.target, animated: e.animated, style: e.style })),
+      edges: edges.map(e => ({ id: e.id, source: e.source, target: e.target })),
       updatedAt: new Date().toISOString(),
     };
     onSave(serialized);
     toast("Workflow saved!", "success");
-  };
+  }, [nodes, edges, workflow, onSave, toast]);
 
-  // Run pipeline
+  // Build multi-branch tasks from output nodes
+  const buildTasks = useCallback(() => {
+    const outputNodes = nodes.filter(n => n.data.type === "output_dataset" && n.data.config?.outputName);
+    const inputNode   = nodes.find(n => n.data.type === "input_dataset" && n.data.config?.dataset);
+    if (!inputNode || !outputNodes.length) return [];
+
+    return outputNodes.map((outNode, idx) => {
+      const taskId    = outNode.data.config?.taskId || `task_${idx + 1}`;
+      const transforms = buildTransformChain(outNode.id, nodes, edges).filter(t => t.type !== "output_dataset");
+      // Find dependencies (other output nodes that feed into this one via intermediate nodes)
+      const depends_on = [];
+      return { task_id: taskId, output_name: outNode.data.config.outputName, transforms, depends_on };
+    });
+  }, [nodes, edges]);
+
   const handleRun = async () => {
     const inputNodes  = nodes.filter(n => n.data.type === "input_dataset");
     const outputNodes = nodes.filter(n => n.data.type === "output_dataset");
+    if (!inputNodes.length)  return toast("Add an Input Dataset node first", "error");
+    if (!outputNodes.length) return toast("Add an Output Dataset node first", "error");
+    if (!inputNodes[0].data.config?.dataset)  return toast("Configure Input Dataset first", "error");
+    const unconfigOut = outputNodes.find(n => !n.data.config?.outputName);
+    if (unconfigOut) return toast("All Output Dataset nodes must be configured", "error");
 
-    if (inputNodes.length === 0)  return toast("Add an Input Dataset node first", "error");
-    if (outputNodes.length === 0) return toast("Add an Output Dataset node first", "error");
+    // Check all nodes are connected
+    const utilNodes = nodes.filter(n => !["input_dataset","output_dataset"].includes(n.data.type));
+    const disconnected = utilNodes.find(n => !edges.some(e => e.target === n.id));
+    if (disconnected) return toast(`Node "${disconnected.data.label}" is not connected`, "error");
 
-    const unconfigInput  = inputNodes.find(n => !n.data.config?.dataset);
-    const unconfigOutput = outputNodes.find(n => !n.data.config?.outputName);
-    if (unconfigInput)  return toast("Configure Input Dataset node first", "error");
-    if (unconfigOutput) return toast("Configure Output Dataset node first", "error");
+    const input = inputNodes[0].data.config.dataset;
+      const tasks = buildTasks();
+      const inputTable = input.table_name ? `staging.${input.table_name}` : `staging.${input.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g,'_')}`;
 
-    const input      = inputNodes[0].data.config.dataset;
-    const output     = outputNodes[0].data.config;
-    const transforms = nodes
-      .filter(n => !["input_dataset","output_dataset"].includes(n.data.type))
-      .map(n => ({ type: n.data.type, config: n.data.config }));
+      // --- TAMBAHAN KODE: Ambil nama output untuk dijadikan nama DAG ---
+      const mainOutput = tasks[0].output_name; 
+      const safeOutputName = mainOutput.replace(/[^a-zA-Z0-9_]/g, '_'); // Pastikan aman untuk Airflow
+      const customDagId = `dag_${safeOutputName}`;
 
-    const inputTable = input.table_name
-      ? `staging.${input.table_name}`
-      : `staging.${input.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g, '_')}`;
-
-    setRunning(true);
-    try {
-      const r = await API.runNewPipeline({
-        workflow_id:   workflow.id,
-        workflow_name: workflow.name,
-        input_table:   inputTable,
-        output_name:   output.outputName,
-        description:   output.description || "",
-        transforms,
-      });
-
+      setRunning(true);
+      try {
+        const r = await API.runPipeline({
+          workflow_id:   customDagId,           // <-- Sekarang ID-nya memakai nama output
+          workflow_name: `Pipeline ${mainOutput}`, // <-- Nama workflow juga menyesuaikan
+          input_table:   inputTable,
+          tasks,
+          description:   workflow.description || "",
+        });
+      
       const { run_id, dag_id } = r.data;
-      toast(`Pipeline triggered! DAG: ${dag_id}`, "success");
+      toast(`Spark Pipeline triggered! DAG: ${dag_id}`, "success");
       setDagStatus({ dag_id, state: "queued", run_id });
       handleSave();
 
-      // Poll status via backend
-      const poll = setInterval(async () => {
+      pollRef.current = setInterval(async () => {
         try {
           const s = await API.getDagStatus(run_id);
-          const { state, tasks } = s.data;
+          const { state, tasks: tStates } = s.data;
           setDagStatus(s.data);
-          setTaskStates(tasks || {});
-
+          setTaskStates(tStates || {});
           if (["success","failed"].includes(state)) {
-            clearInterval(poll);
+            clearInterval(pollRef.current);
             setRunning(false);
-            toast(
-              state === "success" ? "Pipeline completed!" : "Pipeline failed",
-              state === "success" ? "success" : "error"
-            );
+            toast(state === "success" ? "Pipeline completed! ✓" : "Pipeline failed", state === "success" ? "success" : "error");
             if (state === "success") handleSave();
           }
         } catch {}
@@ -400,61 +576,44 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     }
   };
 
-  // Poll DAG
-  useEffect(() => {
-    if (!running) return;
-    const poll = setInterval(async () => {
-      try {
-        const runs = await API.getDagRuns("etl_pipeline");
-        const run  = runs.data.dag_runs?.[0];
-        if (!run) return;
-        setDagStatus(run);
-        const tasks = await API.getTaskInstances("etl_pipeline", run.dag_run_id);
-        const sm = {};
-        tasks.data.task_instances?.forEach(t => { sm[t.task_id] = t.state || "none"; });
-        setTaskStates(sm);
-        if (["success","failed"].includes(run.state)) {
-          setRunning(false);
-          toast(run.state === "success" ? "Pipeline completed!" : "Pipeline failed", run.state === "success" ? "success" : "error");
-          if (run.state === "success") handleSave();
-        }
-      } catch {}
-    }, 6000);
-    return () => clearInterval(poll);
-  }, [running]);
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   const STATUS_BG     = { success: C.greenTint, running: C.blueTint, failed: C.redTint, queued: C.goldTint, none: C.g50 };
   const STATUS_BORDER = { success: C.green, running: C.blue, failed: C.red, queued: C.gold, none: C.g300 };
 
-  // Rebuild node callbacks after load (they don't serialize)
   useEffect(() => {
-    setNodes(ns => ns.map(n => ({
-      ...n, data: {
-        ...n.data,
-        onDelete:    (nid) => setNodes(ns2 => ns2.filter(x => x.id !== nid)),
-        onDuplicate: (nid) => setNodes(ns2 => {
-          const o = ns2.find(x => x.id === nid); if (!o) return ns2;
-          return [...ns2, { ...o, id: `n${Date.now()}`, position: { x: o.position.x + 30, y: o.position.y + 30 } }];
-        }),
-        onConfig:    (nid, val) => setNodes(ns2 => ns2.map(x => x.id === nid ? { ...x, data: { ...x.data, config: { ...x.data.config, ...val } } } : x)),
-        onConfigure: (nid) => setConfigModal({ nodeId: nid, type: n.data.type }),
-      }
-    })));
-  }, []);
+      if (!Object.keys(taskStates).length) return;
+      
+      setNodes(ns => {
+        let hasChanges = false;
+        
+        const newNodes = ns.map(n => {
+          const state = taskStates[n.id] || "none";
+          if (!STATUS_BG[state]) return n;
+          
+          const newBorder = STATUS_BORDER[state];
+          // Jangan update jika border color sudah sama
+          if (n.style?.borderColor === newBorder) return n; 
+          
+          hasChanges = true;
+          return { ...n, style: { ...n.style, borderColor: newBorder } };
+        });
+        
+        return hasChanges ? newNodes : ns;
+      });
+    }, [taskStates, setNodes]);
 
-  // Update task state colors
-  useEffect(() => {
-    if (!Object.keys(taskStates).length) return;
-    setNodes(ns => ns.map(n => {
-      const state = taskStates[n.id] || "none";
-      return { ...n, style: { background: STATUS_BG[state], borderColor: STATUS_BORDER[state] } };
-    }));
-  }, [taskStates]);
+  const utilNodeUpstreamCols = useMemo(() => {
+    if (!utilNode) return [];
+    return getUpstreamColumns(utilNode.id, nodes, edges);
+  }, [utilNode, nodes, edges]);
+
+  const outputNodeCount = nodes.filter(n => n.data.type === "output_dataset").length;
 
   return (
-    <div style={{ display: "flex", flex: 1, overflow: "hidden", flexDirection: "column" }}>
-      {/* Editor topbar */}
-      <div style={{ background: C.white, borderBottom: `1px solid ${C.g200}`, padding: "0 20px", height: 50, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+    <div style={{ display: "flex", flex: 1, overflow: "hidden", flexDirection: "column", fontFamily: "'DM Sans',sans-serif" }}>
+      {/* Top bar */}
+      <div style={{ background: C.white, borderBottom: `1px solid ${C.g200}`, padding: "0 20px", height: 52, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <button onClick={onBack} style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 12px", borderRadius: 7, border: `1px solid ${C.g200}`, background: C.g50, cursor: "pointer", fontSize: 12, fontWeight: 600, color: C.g600 }}>
             <Ic.Back /> Back
@@ -462,27 +621,27 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
           <div>
             <span style={{ fontWeight: 800, fontSize: 14, color: C.navy }}>{workflow.name}</span>
             <span style={{ fontSize: 11, color: C.g400, marginLeft: 8 }}>{nodes.length} nodes · {edges.length} edges</span>
+            {outputNodeCount > 1 && <span style={{ fontSize: 11, color: C.spark, marginLeft: 8, fontWeight: 700 }}>⑂ {outputNodeCount} outputs</span>}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           {dagStatus && (
             <div style={{ padding: "4px 10px", borderRadius: 20, fontSize: 11, fontWeight: 700, background: STATUS_BG[dagStatus.state] || C.g100, color: STATUS_BORDER[dagStatus.state] || C.g500 }}>
-              DAG: {dagStatus.state?.toUpperCase()}
+              ⚡ DAG: {dagStatus.state?.toUpperCase()}
             </div>
           )}
           <button onClick={handleSave} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 14px", borderRadius: 7, border: `1px solid ${C.g200}`, background: C.white, cursor: "pointer", fontSize: 12, fontWeight: 600, color: C.g600 }}>
             <Ic.Save /> Save
           </button>
-          <button onClick={handleRun} disabled={running} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 16px", borderRadius: 7, background: running ? C.g300 : `linear-gradient(90deg,${C.blue},${C.blueMid})`, border: "none", cursor: running ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 700, color: C.white, boxShadow: running ? "none" : `0 2px 8px ${C.blue}44` }}>
-            {running ? <>⟳ Running…</> : <><Ic.Play /> Run Pipeline</>}
+          <button onClick={handleRun} disabled={running} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 16px", borderRadius: 7, background: running ? C.g300 : `linear-gradient(135deg,${C.spark},${C.blue})`, border: "none", cursor: running ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 700, color: C.white, boxShadow: running ? "none" : `0 2px 12px ${C.blue}55` }}>
+            <Ic.Spark /> {running ? "Running…" : "Run Spark Pipeline"}
           </button>
         </div>
       </div>
 
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         {/* Left panel */}
-        <div style={{ width: 210, background: C.white, borderRight: `1px solid ${C.g200}`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
-          {/* Tabs */}
+        <div style={{ width: 215, background: C.white, borderRight: `1px solid ${C.g200}`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
           <div style={{ display: "flex", borderBottom: `1px solid ${C.g200}` }}>
             {Object.entries(NODE_PALETTE).map(([k, v]) => (
               <button key={k} onClick={() => setWfTab(k)} style={{ flex: 1, padding: "9px 0", fontSize: 11, fontWeight: 700, border: "none", cursor: "pointer", borderBottom: wfTab === k ? `2px solid ${v.color}` : "2px solid transparent", background: wfTab === k ? C.g50 : C.white, color: wfTab === k ? v.color : C.g400 }}>
@@ -490,198 +649,220 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
               </button>
             ))}
           </div>
-
-          {/* Node list */}
           <div style={{ flex: 1, overflow: "auto", padding: "6px 0" }}>
             {NODE_PALETTE[wfTab].items.map(item => (
               <button key={item.type} onClick={() => addNode(item)}
                 onMouseEnter={e => e.currentTarget.style.background = C.g50}
                 onMouseLeave={e => e.currentTarget.style.background = "none"}
                 style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", background: "none", border: "none", cursor: "pointer", textAlign: "left" }}>
-                <span style={{ width: 7, height: 7, borderRadius: 2, background: (nStyle(item.type)).bg, flexShrink: 0 }} />
+                <span style={{ width: 7, height: 7, borderRadius: 2, background: nodeBg(item.type), flexShrink: 0 }} />
                 <span style={{ fontSize: 12, fontWeight: 500, color: C.g700 }}>{item.label}</span>
-                <span style={{ marginLeft: "auto", color: C.g300 }}><Ic.Plus /></span>
+                <Ic.Plus />
               </button>
             ))}
           </div>
-
-          {/* Clear button */}
-          <div style={{ padding: 12, borderTop: `1px solid ${C.g200}` }}>
+          {/* Spark info */}
+          <div style={{ padding: "10px 12px", borderTop: `1px solid ${C.g200}`, background: C.sparkTint }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.spark, marginBottom: 4, display: "flex", alignItems: "center", gap: 4 }}><Ic.Spark /> Spark Features</div>
+            <div style={{ fontSize: 9, color: C.g500, lineHeight: 1.6 }}>
+              Auto-size resources • Dynamic allocation • Parquet output • Multi-branch tasks
+            </div>
+          </div>
+          <div style={{ padding: 10, borderTop: `1px solid ${C.g200}` }}>
             <button onClick={() => { setNodes([]); setEdges([]); setDagStatus(null); setTaskStates({}); }}
-              style={{ width: "100%", padding: "7px 0", background: C.g50, border: `1px solid ${C.g200}`, borderRadius: 7, color: C.g500, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+              style={{ width: "100%", padding: "6px 0", background: C.g50, border: `1px solid ${C.g200}`, borderRadius: 7, color: C.g500, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
               Clear Canvas
             </button>
           </div>
         </div>
 
         {/* Canvas */}
-        <div style={{ flex: 1, position: "relative" }}>
+        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
           {nodes.length === 0 && (
             <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 5 }}>
-              <div style={{ fontSize: 36, marginBottom: 10 }}>⚡</div>
-              <div style={{ fontWeight: 700, color: C.g400, marginBottom: 4 }}>Canvas is empty</div>
-              <div style={{ fontSize: 12, color: C.g300 }}>Start with an Input Dataset node from the left panel</div>
+              <div style={{ fontSize: 40, marginBottom: 12 }}>⚡</div>
+              <div style={{ fontWeight: 800, color: C.g400, marginBottom: 4, fontSize: 16 }}>Canvas is empty</div>
+              <div style={{ fontSize: 12, color: C.g300 }}>Add nodes from the left panel</div>
+              <div style={{ fontSize: 11, color: C.g300, marginTop: 4 }}>Multiple Output nodes = Multi-branch pipeline</div>
             </div>
           )}
-          <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} nodeTypes={nodeTypes} fitView style={{ background: C.g50 }}>
+          <ReactFlow
+            nodes={nodes} edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            nodeTypes={nodeTypes}
+            fitView
+            style={{ background: C.g50 }}
+          >
             <Background color={C.g200} gap={20} />
             <Controls style={{ background: C.white, border: `1px solid ${C.g200}` }} />
-            <MiniMap style={{ background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8 }} nodeColor={n => nStyle(n.data?.type).bg} />
+            <MiniMap style={{ background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8 }} nodeColor={n => nodeBg(n.data?.type)} />
             <Panel position="top-right">
-              <div style={{ background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, padding: "4px 10px", fontSize: 11, color: C.g500 }}>
-                {nodes.length} nodes · {edges.length} edges
+              <div style={{ background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, padding: "4px 10px", fontSize: 11, color: C.g500, display: "flex", alignItems: "center", gap: 8 }}>
+                <Ic.Spark />
+                <span style={{ color: C.spark, fontWeight: 700 }}>Spark DAG</span>
+                <span style={{ color: C.g400 }}>{nodes.length}N · {edges.length}E · {outputNodeCount}Out</span>
               </div>
             </Panel>
           </ReactFlow>
+
+          {/* Preview panel */}
+          {previewNode && (
+            <NodePreviewPanel
+              node={previewNode}
+              datasets={datasets}
+              edges={edges}
+              nodes={nodes}
+              onClose={() => setPreviewNode(null)}
+            />
+          )}
         </div>
       </div>
 
-      {/* ── Input Dataset Config Modal ── */}
+      {/* Input Dataset Config Modal */}
       {configModal?.type === "input_dataset" && (
         <Modal title="Configure Input Dataset" onClose={() => setConfigModal(null)}>
-          <div style={{ marginBottom: 16 }}>
+          <div style={{ marginBottom: 14 }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 8 }}>Select Dataset</div>
             {datasets.length === 0 ? (
-              <div style={{ background: C.redTint, borderRadius: 8, padding: 12, fontSize: 12, color: C.red }}>
-                No datasets available. Upload a dataset in Data Source first.
-              </div>
+              <div style={{ background: C.redTint, borderRadius: 8, padding: 12, fontSize: 12, color: C.red }}>No datasets available. Upload one first.</div>
             ) : (
               <select value={inputConfig.datasetId} onChange={e => setInputConfig({ datasetId: e.target.value })}
                 style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, color: C.g700, outline: "none" }}>
                 <option value="">— Choose a dataset —</option>
-                {datasets.map(d => (
-                  <option key={d.id} value={d.id}>{d.name} ({d.row_count?.toLocaleString() || "?"} rows · {d.type})</option>
-                ))}
+                {datasets.map(d => <option key={d.id} value={d.id}>{d.name} ({d.row_count?.toLocaleString() || "?"} rows · {d.type}{d.is_large ? " · ⚡ Parquet" : ""})</option>)}
               </select>
             )}
           </div>
-
-          {/* Dataset preview */}
           {inputConfig.datasetId && (() => {
             const ds = datasets.find(d => d.id === parseInt(inputConfig.datasetId));
             return ds ? (
-              <div style={{ background: C.blueTint, borderRadius: 8, padding: 12, marginBottom: 16 }}>
-                <div style={{ fontSize: 11, fontWeight: 700, color: C.blue, marginBottom: 6 }}>{ds.name}</div>
-                <div style={{ display: "flex", gap: 12, fontSize: 11, color: C.blue, opacity: 0.8 }}>
-                  <span>{ds.row_count?.toLocaleString()} rows</span>
-                  <span>{ds.file_size}</span>
-                  <span>{ds.type}</span>
+              <div style={{ background: C.blueTint, borderRadius: 8, padding: 12, marginBottom: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.blue, marginBottom: 4 }}>{ds.name}</div>
+                <div style={{ display: "flex", gap: 12, fontSize: 11, color: C.blue, opacity: 0.8, marginBottom: ds.is_large ? 6 : 0 }}>
+                  <span>{ds.row_count?.toLocaleString()} rows</span><span>{ds.file_size}</span><span>{ds.type}</span>
                 </div>
+                {ds.is_large && <div style={{ fontSize: 11, color: C.spark, fontWeight: 700 }}>⚡ Large dataset — will use Parquet + Spark</div>}
                 {ds.columns?.length > 0 && (
                   <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 4 }}>
-                    {ds.columns.map(c => (
-                      <span key={c} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: C.blue + "22", color: C.blue, fontWeight: 600 }}>{c}</span>
-                    ))}
+                    {ds.columns.map(c => <span key={c} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: C.blue+"22", color: C.blue, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>)}
                   </div>
                 )}
               </div>
             ) : null;
           })()}
-
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setConfigModal(null)} style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
-            <button onClick={applyInputConfig} disabled={!inputConfig.datasetId} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !inputConfig.datasetId ? C.g300 : C.blue, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !inputConfig.datasetId ? "not-allowed" : "pointer" }}>
-              Apply Dataset
-            </button>
+            <button onClick={applyInputConfig} disabled={!inputConfig.datasetId} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !inputConfig.datasetId ? C.g300 : C.blue, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !inputConfig.datasetId ? "not-allowed" : "pointer" }}>Apply Dataset</button>
           </div>
         </Modal>
       )}
 
-      {/* ── Output Dataset Config Modal ── */}
+      {/* Output Dataset Config Modal */}
       {configModal?.type === "output_dataset" && (
         <Modal title="Configure Output Dataset" onClose={() => setConfigModal(null)}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Output Table Name <span style={{ color: C.red }}>*</span></div>
-              <input value={outputConfig.outputName} onChange={e => setOutputConfig(o => ({ ...o, outputName: e.target.value.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"") })) }
-                placeholder="e.g. sales_summary_2026" style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${outputConfig.outputName ? C.green : C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, fontFamily: "monospace" }} />
-              <div style={{ fontSize: 10, color: C.g400, marginTop: 4 }}>Lowercase letters, numbers, and underscores only. This will be saved as warehouse.{outputConfig.outputName || "your_table"}</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Task ID <span style={{ fontSize: 10, color: C.g400 }}>(unique per output in this workflow)</span></div>
+              <input value={outputConfig.taskId}
+                onChange={e => setOutputConfig(o => ({ ...o, taskId: e.target.value.toLowerCase().replace(/[^a-z0-9_]/g,"_") }))}
+                placeholder="e.g. task_sales_clean"
+                style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, fontFamily: "monospace" }} />
+            </div>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Output Table Name *</div>
+              <input value={outputConfig.outputName}
+                onChange={e => setOutputConfig(o => ({ ...o, outputName: e.target.value.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"") }))}
+                placeholder="e.g. sales_clean_2026"
+                style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1.5px solid ${outputConfig.outputName ? C.green : C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, fontFamily: "monospace" }} />
+              <div style={{ fontSize: 10, color: C.g400, marginTop: 3 }}>Saved as warehouse.{outputConfig.outputName || "your_table"}</div>
             </div>
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Description</div>
               <textarea value={outputConfig.description} onChange={e => setOutputConfig(o => ({ ...o, description: e.target.value }))}
-                placeholder="Describe what this output contains..." rows={3} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, resize: "none", fontFamily: "'DM Sans',sans-serif" }} />
+                placeholder="Describe this output..." rows={2}
+                style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, resize: "none", fontFamily: "'DM Sans',sans-serif" }} />
             </div>
-
-            {outputConfig.outputName && (
-              <div style={{ background: C.greenTint, borderRadius: 8, padding: 10, fontSize: 11, color: C.green }}>
-                <span style={{ fontWeight: 700 }}>Preview: </span>
-                Data will be saved to <code style={{ background: C.white, padding: "1px 5px", borderRadius: 4 }}>warehouse.{outputConfig.outputName}</code>
-                {outputConfig.description && <div style={{ marginTop: 4, opacity: 0.8 }}>{outputConfig.description}</div>}
-              </div>
-            )}
+            {/* Upstream columns */}
+            {(() => {
+              const sourceEdge = edges.find(e => e.target === configModal.nodeId);
+              const upCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
+              return upCols.length > 0 ? (
+                <div style={{ background: C.greenTint, borderRadius: 8, padding: 10 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.green, marginBottom: 6 }}>{upCols.length} columns will be saved:</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {upCols.map(c => <span key={c} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: C.green+"22", color: C.green, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>)}
+                  </div>
+                </div>
+              ) : null;
+            })()}
+            {/* Download format */}
+            <div style={{ background: C.sparkTint, borderRadius: 8, padding: 10, fontSize: 11, color: C.spark }}>
+              <Ic.Spark /> Output will be downloadable as CSV or Parquet after pipeline runs
+            </div>
           </div>
-
           <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
             <button onClick={() => setConfigModal(null)} style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
-            <button onClick={applyOutputConfig} disabled={!outputConfig.outputName} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !outputConfig.outputName ? C.g300 : C.green, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !outputConfig.outputName ? "not-allowed" : "pointer" }}>
-              Save Output Config
-            </button>
+            <button onClick={applyOutputConfig} disabled={!outputConfig.outputName} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !outputConfig.outputName ? C.g300 : C.green, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !outputConfig.outputName ? "not-allowed" : "pointer" }}>Save Output Config</button>
           </div>
         </Modal>
       )}
 
-      {/* ── Utility Node Config Modal ── */}
-      {utilConfigNode && (
+      {/* Utility Config Modal */}
+      {utilNode && (
         <UtilityConfigModal
-          node={utilConfigNode}
-          columns={(() => {
-            // Find columns from connected input dataset node
-            const inputNode = nodes.find(n => n.data?.type === "input_dataset" && n.data?.config?.dataset);
-            return inputNode?.data?.config?.dataset?.columns || [];
-          })()}
+          node={utilNode}
+          columns={utilNodeUpstreamCols}
           allNodes={nodes}
           onSave={(nodeId, cfg) => {
-            setNodes(ns => ns.map(n => n.id === nodeId ? {
-              ...n, data: { ...n.data, config: cfg }
-            } : n));
-            setUtilConfigNode(null);
+            const cbs = buildCallbacks();
+            setNodes(ns => ns.map(n => n.id === nodeId ? { ...n, data: { ...n.data, config: cfg, ...cbs } } : n));
+            setUtilNode(null);
+            toast("Node configured!", "success");
           }}
-          onClose={() => setUtilConfigNode(null)}
+          onClose={() => setUtilNode(null)}
         />
       )}
     </div>
   );
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
+// ── Main App ──────────────────────────────────────────────────────────────────
 export default function ETLPipelineApp() {
   const [page, setPage]         = useState("workflow");
   const [collapsed, setCollapsed] = useState(false);
   const [toasts, setToasts]     = useState([]);
   const [airflowOk, setAirflowOk] = useState(false);
 
-  // Dataset state
-  const [datasets, setDatasets]   = useState([]);
-  const [dsLoading, setDsLoading] = useState(false);
-  const [dsTab, setDsTab]         = useState("files");
-  const [searchQ, setSearchQ]     = useState("");
+  const [datasets, setDatasets]     = useState([]);
+  const [dsLoading, setDsLoading]   = useState(false);
+  const [dsTab, setDsTab]           = useState("files");
+  const [searchQ, setSearchQ]       = useState("");
   const [filterType, setFilterType] = useState("all");
   const [selectedDS, setSelectedDS] = useState(null);
-  const [preview, setPreview]     = useState(null);
+  const [preview, setPreview]       = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
-  const [addTab, setAddTab]       = useState("csv");
+  const [addTab, setAddTab]         = useState("csv");
   const [uploadFile, setUploadFile] = useState(null);
   const [uploadName, setUploadName] = useState("");
   const [uploading, setUploading]   = useState(false);
-  const [dbForm, setDbForm] = useState({ host: "postgres", port: "5432", database: "airflow", username: "airflow", password: "airflow" });
+  const [dbForm, setDbForm]         = useState({ host: "postgres", port: "5432", database: "airflow", username: "airflow", password: "airflow" });
   const [dbConnecting, setDbConnecting] = useState(false);
+
   const [pipelineRuns, setPipelineRuns] = useState([]);
-  const [selectedRun, setSelectedRun]  = useState(null);
+  const [selectedRun, setSelectedRun]   = useState(null);
   const [runPreview, setRunPreview]     = useState(null);
   const [runPreviewLoading, setRunPreviewLoading] = useState(false);
 
-  // Workflow state
   const [workflows, setWorkflows]       = useState([]);
   const [wfSearch, setWfSearch]         = useState("");
   const [wfFilter, setWfFilter]         = useState("all");
-  const [activeWorkflow, setActiveWorkflow] = useState(null); // editing
+  const [activeWorkflow, setActiveWorkflow] = useState(null);
   const [showNewWfModal, setShowNewWfModal] = useState(false);
   const [newWfForm, setNewWfForm]       = useState({ name: "", description: "" });
 
-  // Visualization state
-  const [vizDatasets, setVizDatasets]     = useState([]);
   const [warehouseTables, setWarehouseTables] = useState([]);
 
   const toast = useCallback((msg, type = "info") => {
@@ -690,7 +871,6 @@ export default function ETLPipelineApp() {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
   }, []);
 
-  // ── Boot ───────────────────────────────────────────────────────
   useEffect(() => {
     axios.get("/airflow-api/health").then(() => setAirflowOk(true)).catch(() => setAirflowOk(false));
     loadDatasets();
@@ -703,7 +883,6 @@ export default function ETLPipelineApp() {
     try {
       const r = await API.getDatasets();
       const data = Array.isArray(r.data) ? r.data : [];
-      // Load columns for each deployed dataset
       const enriched = await Promise.all(data.map(async ds => {
         if (ds.status === "deployed" && ds.table_name) {
           try { const p = await API.previewDataset(ds.id, 1); return { ...ds, columns: p.data.columns || [] }; }
@@ -712,19 +891,13 @@ export default function ETLPipelineApp() {
         return ds;
       }));
       setDatasets(enriched);
-      setVizDatasets(enriched.filter(d => d.status === "deployed"));
-    } catch {
-      toast("Backend not running — some features may be unavailable", "error");
-      setDatasets([]); setVizDatasets([]);
-    } finally { setDsLoading(false); }
+    } catch { toast("Backend not reachable", "error"); setDatasets([]); }
+    finally { setDsLoading(false); }
   };
 
   const loadWarehouse = async () => {
     try {
-      const [tablesRes, runsRes] = await Promise.all([
-        API.getWarehouseTables(),
-        API.getPipelineRuns(),
-      ]);
+      const [tablesRes, runsRes] = await Promise.all([API.getWarehouseTables(), API.getPipelineRuns()]);
       setWarehouseTables(Array.isArray(tablesRes.data) ? tablesRes.data : []);
       setPipelineRuns(Array.isArray(runsRes.data) ? runsRes.data : []);
     } catch {}
@@ -741,8 +914,9 @@ export default function ETLPipelineApp() {
     if (!uploadFile) return toast("Select a file first", "error");
     setUploading(true);
     try {
-      await API.uploadDataset(uploadFile, uploadName || uploadFile.name);
-      toast("Dataset uploaded & deployed!", "success");
+      const r = await API.uploadDataset(uploadFile, uploadName || uploadFile.name);
+      const isLarge = r.data.is_large;
+      toast(isLarge ? "Large dataset uploaded → converted to Parquet!" : "Dataset uploaded!", "success");
       setShowAddModal(false); setUploadFile(null); setUploadName("");
       await loadDatasets(); await loadWarehouse();
     } catch (e) { toast(e.response?.data?.detail || "Upload failed", "error"); }
@@ -762,9 +936,8 @@ export default function ETLPipelineApp() {
     catch { toast("Delete failed", "error"); }
   };
 
-  // ── Workflow actions ───────────────────────────────────────────
   const createWorkflow = () => {
-    if (!newWfForm.name.trim()) return toast("Workflow name is required", "error");
+    if (!newWfForm.name.trim()) return toast("Workflow name required", "error");
     const wf = {
       id: `wf_${Date.now()}`, name: newWfForm.name, description: newWfForm.description,
       nodes: [], edges: [], status: "draft",
@@ -790,7 +963,6 @@ export default function ETLPipelineApp() {
     toast("Workflow deleted", "success");
   };
 
-  // Filtered
   const filteredDS = datasets.filter(d => {
     const ms = d.name.toLowerCase().includes(searchQ.toLowerCase());
     const mt = filterType === "all" || d.type?.toLowerCase() === filterType;
@@ -812,18 +984,11 @@ export default function ETLPipelineApp() {
     { id: "visualization", label: "Visualization",   Icon: Ic.Chart },
   ];
 
-  // If editing a workflow, show editor full screen
   if (activeWorkflow && page === "workflow") {
     return (
       <div style={{ display: "flex", height: "100vh", fontFamily: "'DM Sans','Segoe UI',sans-serif", overflow: "hidden" }}>
-        <style>{`*{box-sizing:border-box;margin:0;padding:0} @keyframes slideIn{from{transform:translateX(40px);opacity:0}to{transform:none;opacity:1}} .hrow:hover{background:${C.blueTint}!important}`}</style>
-        <WorkflowEditor
-          workflow={activeWorkflow}
-          datasets={datasets}
-          onSave={saveWorkflow}
-          onBack={() => setActiveWorkflow(null)}
-          toast={toast}
-        />
+        <style>{`*{box-sizing:border-box;margin:0;padding:0}`}</style>
+        <WorkflowEditor workflow={activeWorkflow} datasets={datasets} onSave={saveWorkflow} onBack={() => setActiveWorkflow(null)} toast={toast} />
         <Toast toasts={toasts} />
       </div>
     );
@@ -831,19 +996,19 @@ export default function ETLPipelineApp() {
 
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "'DM Sans','Segoe UI',sans-serif", background: C.off, overflow: "hidden" }}>
-      <style>{`*{box-sizing:border-box;margin:0;padding:0} @keyframes slideIn{from{transform:translateX(40px);opacity:0}to{transform:none;opacity:1}} .hrow:hover{background:${C.blueTint}!important}`}</style>
+      <style>{`*{box-sizing:border-box;margin:0;padding:0} .hrow:hover{background:${C.blueTint}!important}`}</style>
 
       {/* SIDEBAR */}
-      <aside style={{ width: collapsed ? 58 : 210, flexShrink: 0, background: `linear-gradient(180deg,${C.navy},${C.navyMid})`, display: "flex", flexDirection: "column", transition: "width .22s cubic-bezier(.4,0,.2,1)", boxShadow: "3px 0 20px rgba(0,0,0,0.22)", zIndex: 20 }}>
+      <aside style={{ width: collapsed ? 58 : 210, flexShrink: 0, background: `linear-gradient(180deg,${C.navy},${C.navyMid})`, display: "flex", flexDirection: "column", transition: "width .22s", boxShadow: "3px 0 20px rgba(0,0,0,0.22)", zIndex: 20 }}>
         <div style={{ padding: collapsed ? "18px 0" : "18px 16px", borderBottom: `1px solid ${C.navyLight}`, display: "flex", alignItems: "center", justifyContent: collapsed ? "center" : "space-between", minHeight: 60 }}>
-          {!collapsed && <div><span style={{ color: C.white, fontWeight: 800, fontSize: 17 }}>ETL<span style={{ color: C.gold }}>Flow</span></span><div style={{ color: C.blueLight, fontSize: 9, marginTop: 1, letterSpacing: 1 }}>PIPELINE STUDIO</div></div>}
+          {!collapsed && <div><span style={{ color: C.white, fontWeight: 800, fontSize: 17 }}>ETL<span style={{ color: C.gold }}>Flow</span></span><div style={{ color: C.blueLight, fontSize: 9, marginTop: 1, letterSpacing: 1 }}>SPARK PIPELINE STUDIO</div></div>}
           <button onClick={() => setCollapsed(v => !v)} style={{ background: "none", border: "none", cursor: "pointer", color: C.blueLight, display: "flex", padding: 4, borderRadius: 5 }}><Ic.Menu /></button>
         </div>
         <nav style={{ flex: 1, padding: "10px 0" }}>
           {nav.map(({ id, label, Icon }) => {
             const active = page === id;
             return (
-              <button key={id} onClick={() => setPage(id)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: collapsed ? "12px 0" : "11px 16px", justifyContent: collapsed ? "center" : "flex-start", background: active ? `linear-gradient(90deg,rgba(29,111,235,.28),transparent)` : "none", border: "none", borderLeft: active ? `3px solid ${C.gold}` : "3px solid transparent", cursor: "pointer", color: active ? C.white : C.blueLight, transition: "all .12s" }}>
+              <button key={id} onClick={() => setPage(id)} style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: collapsed ? "12px 0" : "11px 16px", justifyContent: collapsed ? "center" : "flex-start", background: active ? `linear-gradient(90deg,rgba(29,111,235,.28),transparent)` : "none", border: "none", borderLeft: active ? `3px solid ${C.gold}` : "3px solid transparent", cursor: "pointer", color: active ? C.white : C.blueLight }}>
                 <span style={{ padding: 7, borderRadius: 8, background: active ? C.blue : "rgba(255,255,255,.06)", display: "flex" }}><Icon /></span>
                 {!collapsed && <span style={{ fontSize: 13, fontWeight: active ? 700 : 500 }}>{label}</span>}
               </button>
@@ -852,7 +1017,7 @@ export default function ETLPipelineApp() {
         </nav>
         <div style={{ padding: collapsed ? "14px 0" : "14px 16px", borderTop: `1px solid ${C.navyLight}`, display: "flex", justifyContent: collapsed ? "center" : "flex-start" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, background: airflowOk ? "rgba(22,163,74,.15)" : "rgba(220,38,38,.15)", borderRadius: 20, padding: "4px 10px 4px 6px" }}>
-            <span style={{ width: 7, height: 7, borderRadius: "50%", background: airflowOk ? C.green : C.red, display: "inline-block" }} />
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: airflowOk ? C.green : C.red }} />
             {!collapsed && <span style={{ fontSize: 10, fontWeight: 700, color: airflowOk ? C.green : C.red }}>{airflowOk ? "AIRFLOW OK" : "AIRFLOW DOWN"}</span>}
           </div>
         </div>
@@ -864,22 +1029,21 @@ export default function ETLPipelineApp() {
           <div>
             <div style={{ fontWeight: 800, fontSize: 15, color: C.navy }}>{nav.find(n => n.id === page)?.label}</div>
             <div style={{ fontSize: 10, color: C.g400 }}>
-              {page === "datasource"    && "Upload and manage your datasets"}
-              {page === "workflow"      && "Create and manage ETL workflows"}
-              {page === "visualization" && "Explore deployed data in Metabase"}
+              {page === "datasource" && "Upload & manage datasets · Files >10GB auto-convert to Parquet"}
+              {page === "workflow"   && "Build multi-branch Spark ETL pipelines · 1 Workflow = 1 DAG · Multiple outputs supported"}
+              {page === "visualization" && "Explore deployed data"}
             </div>
           </div>
           {page === "workflow" && (
-            <button onClick={() => setShowNewWfModal(true)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 16px", borderRadius: 8, background: C.blue, color: C.white, border: "none", fontWeight: 700, fontSize: 13, cursor: "pointer", boxShadow: `0 2px 8px ${C.blue}44` }}>
+            <button onClick={() => setShowNewWfModal(true)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 16px", borderRadius: 8, background: `linear-gradient(135deg,${C.spark},${C.blue})`, color: C.white, border: "none", fontWeight: 700, fontSize: 13, cursor: "pointer", boxShadow: `0 2px 8px ${C.blue}44` }}>
               <Ic.Plus /> New Workflow
             </button>
           )}
         </header>
 
-        {/* ════ DATA SOURCE PAGE ════ */}
+        {/* ═══ DATA SOURCE PAGE ═══ */}
         {page === "datasource" && (
           <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-            {/* Left nav */}
             <div style={{ width: 190, background: C.white, borderRight: `1px solid ${C.g200}`, padding: "14px 0", flexShrink: 0 }}>
               <div style={{ padding: "0 14px 8px", fontSize: 10, fontWeight: 700, color: C.g400, letterSpacing: 1.2, textTransform: "uppercase" }}>Input Sources</div>
               {[{ id: "files", label: "Files", subs: ["CSV", "Excel"] }, { id: "rdbms", label: "RDBMS", subs: ["PostgreSQL", "MySQL"] }].map(({ id, label, subs }) => (
@@ -893,7 +1057,6 @@ export default function ETLPipelineApp() {
               ))}
             </div>
 
-            {/* Content */}
             <div style={{ flex: 1, padding: 22, overflow: "auto" }}>
               <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 7, background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, padding: "7px 12px", flex: 1, minWidth: 200, maxWidth: 300 }}>
@@ -901,7 +1064,7 @@ export default function ETLPipelineApp() {
                   <input value={searchQ} onChange={e => setSearchQ(e.target.value)} placeholder="Search datasets..." style={{ border: "none", outline: "none", fontSize: 13, color: C.g700, background: "transparent", width: "100%" }} />
                 </div>
                 <div style={{ display: "flex", gap: 5 }}>
-                  {["all","csv","excel","postgresql","mysql"].map(t => (
+                  {["all","csv","excel","postgresql"].map(t => (
                     <button key={t} onClick={() => setFilterType(t)} style={{ padding: "6px 10px", borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: "pointer", border: filterType === t ? `1px solid ${C.blue}` : `1px solid ${C.g200}`, background: filterType === t ? C.blue : C.white, color: filterType === t ? C.white : C.g600 }}>{t === "all" ? "All" : t.toUpperCase()}</button>
                   ))}
                 </div>
@@ -916,20 +1079,25 @@ export default function ETLPipelineApp() {
               {!dsLoading && (
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(260px,1fr))", gap: 14 }}>
                   {filteredDS.map(ds => (
-                    <div key={ds.id} onClick={() => loadPreview(ds)} style={{ background: C.white, borderRadius: 12, border: selectedDS?.id === ds.id ? `2px solid ${C.blue}` : `1px solid ${C.g200}`, padding: 18, cursor: "pointer", transition: "all .14s", boxShadow: selectedDS?.id === ds.id ? `0 0 0 3px ${C.blue}22` : "0 1px 4px rgba(0,0,0,.05)" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                    <div key={ds.id} onClick={() => loadPreview(ds)} style={{ background: C.white, borderRadius: 12, border: selectedDS?.id === ds.id ? `2px solid ${C.blue}` : `1px solid ${C.g200}`, padding: 16, cursor: "pointer", transition: "all .14s", boxShadow: selectedDS?.id === ds.id ? `0 0 0 3px ${C.blue}22` : "0 1px 4px rgba(0,0,0,.05)" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                         <span style={{ padding: "3px 9px", borderRadius: 5, fontSize: 10, fontWeight: 700, background: `${TYPE_COLOR[ds.type] || C.g400}18`, color: TYPE_COLOR[ds.type] || C.g400 }}>{ds.type}</span>
-                        <span style={{ padding: "3px 9px", borderRadius: 20, fontSize: 10, fontWeight: 700, background: `${STATUS_COLOR[ds.status] || C.g400}18`, color: STATUS_COLOR[ds.status] || C.g400 }}>{ds.status}</span>
+                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                          {ds.is_large && <span style={{ padding: "3px 6px", borderRadius: 5, fontSize: 9, fontWeight: 700, background: C.sparkTint, color: C.spark }}>⚡ Parquet</span>}
+                          <span style={{ padding: "3px 9px", borderRadius: 20, fontSize: 10, fontWeight: 700, background: `${STATUS_COLOR[ds.status] || C.g400}18`, color: STATUS_COLOR[ds.status] || C.g400 }}>{ds.status}</span>
+                        </div>
                       </div>
                       <div style={{ fontWeight: 700, fontSize: 14, color: C.navy, marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ds.name}</div>
-                      <div style={{ display: "flex", gap: 12, fontSize: 11, color: C.g400 }}>
+                      <div style={{ display: "flex", gap: 10, fontSize: 11, color: C.g400, marginBottom: 10 }}>
                         {ds.row_count && <span>{ds.row_count.toLocaleString()} rows</span>}
+                        {ds.col_count && <span>{ds.col_count} cols</span>}
                         {ds.file_size && <span>{ds.file_size}</span>}
-                        <span>{ds.created_at?.slice(0,10)}</span>
                       </div>
-                      <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
-                        <button onClick={e => { e.stopPropagation(); loadPreview(ds); }} style={{ flex: 1, padding: "6px 0", borderRadius: 6, border: `1px solid ${C.g200}`, background: C.g50, color: C.g600, fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}><Ic.Eye /> Preview</button>
-                        <button onClick={e => handleDeleteDS(ds.id, e)} style={{ padding: "6px 10px", borderRadius: 6, border: `1px solid ${C.redTint}`, background: C.redTint, color: C.red, cursor: "pointer", display: "flex", alignItems: "center" }}><Ic.Trash /></button>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={e => { e.stopPropagation(); loadPreview(ds); }} style={{ flex: 1, padding: "5px 0", borderRadius: 6, border: `1px solid ${C.g200}`, background: C.g50, color: C.g600, fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}><Ic.Eye /> Preview</button>
+                        <a href={`/api/datasets/${ds.id}/download?format=csv`} download onClick={e => e.stopPropagation()} style={{ padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.blue}33`, background: C.blueTint, color: C.blue, display: "flex", alignItems: "center" }} title="Download CSV"><Ic.Download /></a>
+                        {ds.is_large && <a href={`/api/datasets/${ds.id}/download?format=parquet`} download onClick={e => e.stopPropagation()} style={{ padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.spark}33`, background: C.sparkTint, color: C.spark, display: "flex", alignItems: "center" }} title="Download Parquet"><Ic.Spark /></a>}
+                        <button onClick={e => handleDeleteDS(ds.id, e)} style={{ padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.redTint}`, background: C.redTint, color: C.red, cursor: "pointer", display: "flex", alignItems: "center" }}><Ic.Trash /></button>
                       </div>
                     </div>
                   ))}
@@ -942,12 +1110,15 @@ export default function ETLPipelineApp() {
                 </div>
               )}
 
-              {/* Preview */}
               {selectedDS && (
                 <div style={{ marginTop: 20, background: C.white, borderRadius: 12, border: `1px solid ${C.g200}`, overflow: "hidden", boxShadow: "0 2px 12px rgba(0,0,0,.06)" }}>
                   <div style={{ padding: "12px 18px", background: C.navy, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <span style={{ color: C.white, fontWeight: 700, fontSize: 13 }}>📋 {selectedDS.name}</span>
-                    <button onClick={() => { setSelectedDS(null); setPreview(null); }} style={{ background: "rgba(255,255,255,.1)", border: "none", borderRadius: 5, padding: "3px 8px", cursor: "pointer", color: C.white }}><Ic.X /></button>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <a href={`/api/datasets/${selectedDS.id}/download?format=csv`} download style={{ padding: "4px 10px", borderRadius: 5, background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.2)", color: C.white, fontSize: 11, fontWeight: 700, textDecoration: "none", display: "flex", alignItems: "center", gap: 4 }}><Ic.Download /> CSV</a>
+                      {selectedDS.is_large && <a href={`/api/datasets/${selectedDS.id}/download?format=parquet`} download style={{ padding: "4px 10px", borderRadius: 5, background: "rgba(226,88,34,0.3)", border: "1px solid rgba(226,88,34,0.4)", color: C.white, fontSize: 11, fontWeight: 700, textDecoration: "none", display: "flex", alignItems: "center", gap: 4 }}><Ic.Spark /> Parquet</a>}
+                      <button onClick={() => { setSelectedDS(null); setPreview(null); }} style={{ background: "rgba(255,255,255,.1)", border: "none", borderRadius: 5, padding: "3px 8px", cursor: "pointer", color: C.white }}><Ic.X /></button>
+                    </div>
                   </div>
                   {previewLoading && <div style={{ padding: 32, textAlign: "center", color: C.g400 }}>Loading preview…</div>}
                   {preview && !previewLoading && (
@@ -972,10 +1143,9 @@ export default function ETLPipelineApp() {
           </div>
         )}
 
-        {/* ════ WORKFLOW PAGE ════ */}
+        {/* ═══ WORKFLOW PAGE ═══ */}
         {page === "workflow" && (
           <div style={{ flex: 1, padding: 24, overflow: "auto" }}>
-            {/* Search & filter */}
             <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 7, background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, padding: "7px 12px", flex: 1, minWidth: 200, maxWidth: 320 }}>
                 <Ic.Search />
@@ -988,53 +1158,39 @@ export default function ETLPipelineApp() {
               </div>
             </div>
 
-            {/* Workflow grid */}
             {filteredWF.length === 0 ? (
               <div style={{ textAlign: "center", padding: 60, color: C.g400 }}>
-                <div style={{ fontSize: 36, marginBottom: 12 }}>⚡</div>
-                <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>No workflows yet</div>
-                <div style={{ fontSize: 12, marginBottom: 20 }}>Create your first workflow to start building ETL pipelines</div>
-                <button onClick={() => setShowNewWfModal(true)} style={{ padding: "10px 24px", borderRadius: 8, background: C.blue, border: "none", color: C.white, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
-                  + Create Workflow
-                </button>
+                <div style={{ fontSize: 40, marginBottom: 12 }}>⚡</div>
+                <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4, color: C.navy }}>No workflows yet</div>
+                <div style={{ fontSize: 12, marginBottom: 6 }}>Create your first Spark ETL pipeline</div>
+                <div style={{ fontSize: 11, color: C.g300, marginBottom: 20 }}>1 Workflow = 1 DAG · Multiple Output nodes = Multi-branch pipeline</div>
+                <button onClick={() => setShowNewWfModal(true)} style={{ padding: "10px 24px", borderRadius: 8, background: `linear-gradient(135deg,${C.spark},${C.blue})`, border: "none", color: C.white, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>+ Create Workflow</button>
               </div>
             ) : (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 16 }}>
                 {filteredWF.map(wf => {
-                  const wfStatusColor = { draft: C.g400, running: C.blue, success: C.green, failed: C.red }[wf.status] || C.g400;
-                  const wfStatusBg    = { draft: C.g100, running: C.blueTint, success: C.greenTint, failed: C.redTint }[wf.status] || C.g100;
+                  const wfSC = { draft: C.g400, running: C.blue, success: C.green, failed: C.red }[wf.status] || C.g400;
+                  const wfSB = { draft: C.g100, running: C.blueTint, success: C.greenTint, failed: C.redTint }[wf.status] || C.g100;
+                  const outputCount = (wf.nodes || []).filter(n => n.data?.type === "output_dataset").length;
                   return (
-                    <div key={wf.id} style={{ background: C.white, borderRadius: 14, border: `1px solid ${C.g200}`, overflow: "hidden", boxShadow: "0 2px 10px rgba(0,0,0,.05)", transition: "transform .14s,box-shadow .14s" }}
-                      onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = `0 8px 24px ${C.blue}18`; }}
-                      onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = "0 2px 10px rgba(0,0,0,.05)"; }}>
-
-                      {/* Header stripe */}
-                      <div style={{ height: 5, background: `linear-gradient(90deg,${C.blue},${C.gold})` }} />
-
-                      <div style={{ padding: 18 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
-                          <div style={{ fontWeight: 800, fontSize: 15, color: C.navy, flex: 1, marginRight: 8 }}>{wf.name}</div>
-                          <span style={{ padding: "3px 9px", borderRadius: 20, fontSize: 10, fontWeight: 700, background: wfStatusBg, color: wfStatusColor, flexShrink: 0 }}>{wf.status}</span>
+                    <div key={wf.id} style={{ background: C.white, borderRadius: 14, border: `1px solid ${C.g200}`, overflow: "hidden", boxShadow: "0 2px 10px rgba(0,0,0,.05)" }}>
+                      <div style={{ height: 4, background: `linear-gradient(90deg,${C.spark},${C.blue},${C.gold})` }} />
+                      <div style={{ padding: 16 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                          <div style={{ fontWeight: 800, fontSize: 14, color: C.navy, flex: 1, marginRight: 8 }}>{wf.name}</div>
+                          <span style={{ padding: "3px 9px", borderRadius: 20, fontSize: 10, fontWeight: 700, background: wfSB, color: wfSC, flexShrink: 0 }}>{wf.status}</span>
                         </div>
-
-                        {wf.description && <div style={{ fontSize: 12, color: C.g500, marginBottom: 10, lineHeight: 1.5 }}>{wf.description}</div>}
-
-                        <div style={{ display: "flex", gap: 12, fontSize: 11, color: C.g400, marginBottom: 14 }}>
-                          <span>{wf.nodes?.length || 0} nodes</span>
-                          <span>{wf.edges?.length || 0} edges</span>
+                        {wf.description && <div style={{ fontSize: 12, color: C.g500, marginBottom: 8, lineHeight: 1.5 }}>{wf.description}</div>}
+                        <div style={{ display: "flex", gap: 10, fontSize: 11, color: C.g400, marginBottom: 12 }}>
+                          <span>{(wf.nodes || []).length} nodes</span>
+                          {outputCount > 0 && <span style={{ color: outputCount > 1 ? C.spark : C.g400 }}>⑂ {outputCount} output{outputCount > 1 ? "s" : ""}</span>}
                           <span>{wf.updatedAt?.slice(0,10)}</span>
                         </div>
-
                         <div style={{ display: "flex", gap: 8 }}>
-                          <button onClick={() => setActiveWorkflow(wf)} style={{ flex: 1, padding: "8px 0", borderRadius: 8, background: `linear-gradient(90deg,${C.blue},${C.blueMid})`, border: "none", color: C.white, fontWeight: 700, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
-                            <Ic.Edit /> Edit
+                          <button onClick={() => setActiveWorkflow(wf)} style={{ flex: 1, padding: "7px 0", borderRadius: 8, background: `linear-gradient(135deg,${C.spark},${C.blue})`, border: "none", color: C.white, fontWeight: 700, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
+                            <Ic.Edit /> Open Editor
                           </button>
-                          <button onClick={() => { setActiveWorkflow(wf); }} style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.g50, color: C.g500, cursor: "pointer", display: "flex", alignItems: "center" }} title="Open">
-                            <Ic.ArrowRight />
-                          </button>
-                          <button onClick={() => deleteWorkflow(wf.id)} style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.redTint}`, background: C.redTint, color: C.red, cursor: "pointer", display: "flex", alignItems: "center" }}>
-                            <Ic.Trash />
-                          </button>
+                          <button onClick={() => deleteWorkflow(wf.id)} style={{ padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.redTint}`, background: C.redTint, color: C.red, cursor: "pointer", display: "flex", alignItems: "center" }}><Ic.Trash /></button>
                         </div>
                       </div>
                     </div>
@@ -1045,153 +1201,104 @@ export default function ETLPipelineApp() {
           </div>
         )}
 
-        {/* ════ VISUALIZATION PAGE ════ */}
+        {/* ═══ VISUALIZATION PAGE ═══ */}
         {page === "visualization" && (
           <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-
-            {/* Left panel — list pipeline runs */}
-            <div style={{ width: 280, background: C.white, borderRight: `1px solid ${C.g200}`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
+            <div style={{ width: 290, background: C.white, borderRight: `1px solid ${C.g200}`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
               <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.g200}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div style={{ fontWeight: 700, fontSize: 13, color: C.navy }}>Pipeline Outputs</div>
                 <button onClick={loadWarehouse} style={{ background: "none", border: "none", cursor: "pointer", color: C.g400, display: "flex" }}><Ic.Refresh /></button>
               </div>
-
               <div style={{ flex: 1, overflow: "auto" }}>
                 {pipelineRuns.length === 0 ? (
                   <div style={{ padding: 24, textAlign: "center", color: C.g400 }}>
                     <div style={{ fontSize: 24, marginBottom: 8 }}>📭</div>
                     <div style={{ fontSize: 12 }}>No pipeline runs yet</div>
-                    <div style={{ fontSize: 11, marginTop: 4, color: C.g300 }}>Run a workflow first</div>
                   </div>
-                ) : (
-                  pipelineRuns.map(run => {
-                    const active = selectedRun?.id === run.id;
-                    const tableName = run.output_table?.replace('warehouse.', '') || '';
-                    return (
-                      <div key={run.id} onClick={async () => {
-                        setSelectedRun(run);
-                        setRunPreview(null);
-                        setRunPreviewLoading(true);
-                        try {
-                          const r = await API.previewPipelineRun(run.id);
-                          setRunPreview(r.data);
-                        } catch { }
-                        finally { setRunPreviewLoading(false); }
-                      }} style={{
-                        padding: "12px 16px", cursor: "pointer",
-                        background: active ? C.blueTint : C.white,
-                        borderLeft: active ? `3px solid ${C.blue}` : "3px solid transparent",
-                        borderBottom: `1px solid ${C.g100}`,
-                        transition: "all .12s",
-                      }}>
-                        <div style={{ fontWeight: 700, fontSize: 13, color: active ? C.blue : C.navy, marginBottom: 3 }}>
-                          {tableName}
-                        </div>
-                        <div style={{ fontSize: 11, color: C.g400, marginBottom: 2 }}>
-                          {run.row_count?.toLocaleString()} rows
-                        </div>
-                        <div style={{ fontSize: 10, color: C.g300 }}>
-                          {run.ran_at?.slice(0, 16).replace('T', ' ')}
-                        </div>
-                        {run.workflow_id && run.workflow_id !== 'manual' && (
-                          <div style={{ marginTop: 4, fontSize: 10, padding: "1px 6px", borderRadius: 10, background: C.blueTint2, color: C.blue, display: "inline-block" }}>
-                            {run.workflow_id.slice(0, 12)}…
-                          </div>
-                        )}
+                ) : pipelineRuns.map(run => {
+                  const active = selectedRun?.id === run.id;
+                  const tname  = run.output_table?.replace('warehouse.', '') || '';
+                  const statusC = { success: C.green, failed: C.red, running: C.blue, pending: C.gold }[run.status] || C.g400;
+                  return (
+                    <div key={run.id} onClick={async () => {
+                      setSelectedRun(run); setRunPreview(null); setRunPreviewLoading(true);
+                      try { const r = await API.previewRun(run.id); setRunPreview(r.data); } catch {}
+                      finally { setRunPreviewLoading(false); }
+                    }} style={{ padding: "12px 16px", cursor: "pointer", background: active ? C.blueTint : C.white, borderLeft: active ? `3px solid ${C.blue}` : "3px solid transparent", borderBottom: `1px solid ${C.g100}` }}>
+                      <div style={{ fontWeight: 700, fontSize: 13, color: active ? C.blue : C.navy, marginBottom: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tname}</div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}>
+                        <span style={{ color: C.g400 }}>{run.row_count?.toLocaleString() || "?"} rows</span>
+                        <span style={{ color: statusC, fontWeight: 700 }}>{run.status}</span>
                       </div>
-                    );
-                  })
-                )}
+                      {run.task_id && <div style={{ fontSize: 9, color: C.g400, marginTop: 1 }}>{run.task_id}</div>}
+                      <div style={{ fontSize: 9, color: C.g300, marginTop: 1 }}>{run.ran_at?.slice(0,16).replace('T',' ')}</div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
-            {/* Right panel — preview + Metabase link */}
             <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
               {!selectedRun ? (
                 <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: C.g400 }}>
                   <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
-                  <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>Select a pipeline output</div>
-                  <div style={{ fontSize: 12 }}>Choose from the list on the left to preview data</div>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>Select a pipeline output</div>
                 </div>
               ) : (
                 <>
-                  {/* Header */}
                   <div style={{ padding: "14px 22px", borderBottom: `1px solid ${C.g200}`, background: C.white, display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
                     <div>
-                      <div style={{ fontWeight: 800, fontSize: 15, color: C.navy }}>
-                        {selectedRun.output_table}
-                      </div>
-                      <div style={{ fontSize: 11, color: C.g400, marginTop: 2 }}>
-                        {selectedRun.row_count?.toLocaleString()} rows ·{" "}
-                        {runPreview?.columns?.length || 0} columns ·{" "}
-                        {selectedRun.ran_at?.slice(0, 16).replace("T", " ")}
-                      </div>
+                      <div style={{ fontWeight: 800, fontSize: 15, color: C.navy }}>{selectedRun.output_table}</div>
+                      <div style={{ fontSize: 11, color: C.g400 }}>{selectedRun.row_count?.toLocaleString()} rows · {runPreview?.columns?.length || 0} cols · {selectedRun.ran_at?.slice(0,16).replace("T"," ")}</div>
                     </div>
-                    <a href="http://localhost:3000" target="_blank" rel="noopener noreferrer"
-                      style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 8, background: `linear-gradient(90deg,${C.blue},${C.blueMid})`, color: C.white, fontWeight: 700, fontSize: 13, textDecoration: "none", boxShadow: `0 2px 8px ${C.blue}33` }}>
-                      <Ic.Link /> Open in Metabase
-                    </a>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      {selectedRun.status === "success" && (
+                        <>
+                          <a href={API.downloadRun(selectedRun.id, "csv")} download style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 12px", borderRadius: 7, background: C.blueTint, border: `1px solid ${C.blue}33`, color: C.blue, fontWeight: 700, fontSize: 12, textDecoration: "none" }}><Ic.Download /> CSV</a>
+                          <a href={API.downloadRun(selectedRun.id, "parquet")} download style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 12px", borderRadius: 7, background: C.sparkTint, border: `1px solid ${C.spark}33`, color: C.spark, fontWeight: 700, fontSize: 12, textDecoration: "none" }}><Ic.Spark /> Parquet</a>
+                        </>
+                      )}
+                      <a href="http://localhost:3000" target="_blank" rel="noopener noreferrer" style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 14px", borderRadius: 7, background: `linear-gradient(90deg,${C.blue},${C.blueMid})`, color: C.white, fontWeight: 700, fontSize: 12, textDecoration: "none" }}>
+                        <Ic.Link /> Metabase
+                      </a>
+                    </div>
                   </div>
 
-                  {/* Column info */}
-                  {runPreview && !runPreviewLoading && (
-                    <div style={{ padding: "10px 22px", borderBottom: `1px solid ${C.g100}`, background: C.g50, display: "flex", flexWrap: "wrap", gap: 5, flexShrink: 0 }}>
-                      {runPreview.columns.map(c => (
-                        <span key={c} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: C.blueTint2, color: C.blue, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>
-                      ))}
-                    </div>
-                  )}
+                  {runPreview && <div style={{ padding: "8px 22px", borderBottom: `1px solid ${C.g100}`, background: C.g50, display: "flex", flexWrap: "wrap", gap: 4, flexShrink: 0 }}>
+                    {runPreview.columns.map(c => <span key={c} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: C.blueTint2, color: C.blue, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>)}
+                  </div>}
 
-                  {/* Data preview table */}
                   <div style={{ flex: 1, overflow: "auto" }}>
-                    {runPreviewLoading && (
-                      <div style={{ padding: 40, textAlign: "center", color: C.g400 }}>Loading data preview…</div>
-                    )}
+                    {runPreviewLoading && <div style={{ padding: 40, textAlign: "center", color: C.g400 }}>Loading…</div>}
                     {runPreview && !runPreviewLoading && (
                       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
-                        <thead>
-                          <tr style={{ background: C.g50, position: "sticky", top: 0, zIndex: 1 }}>
-                            {runPreview.columns.map(c => (
-                              <th key={c} style={{ padding: "8px 14px", textAlign: "left", fontWeight: 700, color: C.g600, borderBottom: `2px solid ${C.g200}`, whiteSpace: "nowrap", fontSize: 11 }}>{c}</th>
-                            ))}
-                          </tr>
-                        </thead>
+                        <thead><tr style={{ background: C.g50, position: "sticky", top: 0, zIndex: 1 }}>
+                          {runPreview.columns.map(c => <th key={c} style={{ padding: "8px 14px", textAlign: "left", fontWeight: 700, color: C.g600, borderBottom: `2px solid ${C.g200}`, whiteSpace: "nowrap" }}>{c}</th>)}
+                        </tr></thead>
                         <tbody>
                           {runPreview.rows.map((row, i) => (
-                            <tr key={i} style={{ background: i % 2 === 0 ? C.white : C.g50 }}
-                              onMouseEnter={e => e.currentTarget.style.background = C.blueTint}
-                              onMouseLeave={e => e.currentTarget.style.background = i % 2 === 0 ? C.white : C.g50}>
-                              {runPreview.columns.map(c => (
-                                <td key={c} style={{ padding: "6px 14px", borderBottom: `1px solid ${C.g100}`, color: C.g700, whiteSpace: "nowrap", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>
-                                  {row[c] == null
-                                    ? <span style={{ color: C.g300, fontStyle: "italic" }}>null</span>
-                                    : String(row[c])}
-                                </td>
-                              ))}
+                            <tr key={i} className="hrow" style={{ background: i%2===0?C.white:C.g50 }}>
+                              {runPreview.columns.map(c => <td key={c} style={{ padding: "6px 14px", borderBottom: `1px solid ${C.g100}`, color: C.g700, whiteSpace: "nowrap", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {row[c]==null?<span style={{color:C.g300,fontStyle:"italic"}}>null</span>:String(row[c])}
+                              </td>)}
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     )}
                   </div>
-
-                  {/* Footer */}
-                  {runPreview && (
-                    <div style={{ padding: "8px 22px", borderTop: `1px solid ${C.g200}`, background: C.g50, fontSize: 11, color: C.g400, display: "flex", justifyContent: "space-between", flexShrink: 0 }}>
-                      <span>Showing {Math.min(100, runPreview.rows.length)} of {selectedRun.row_count?.toLocaleString()} rows</span>
-                      <span>Table: <code style={{ fontFamily: "monospace", color: C.blue }}>{selectedRun.output_table}</code></span>
-                    </div>
-                  )}
+                  <div style={{ padding: "8px 22px", borderTop: `1px solid ${C.g200}`, background: C.g50, fontSize: 11, color: C.g400, flexShrink: 0, display: "flex", justifyContent: "space-between" }}>
+                    <span>Preview: {runPreview?.rows?.length || 0} rows shown</span>
+                    <span>Table: <code style={{ fontFamily: "monospace", color: C.blue }}>{selectedRun.output_table}</code></span>
+                  </div>
                 </>
               )}
             </div>
           </div>
         )}
-          </div> 
-          
+      </div>
 
-
-      {/* ════ ADD SOURCE MODAL ════ */}
+      {/* ADD SOURCE MODAL */}
       {showAddModal && (
         <Modal title="Add Data Source" onClose={() => setShowAddModal(false)}>
           <div style={{ display: "flex", borderBottom: `1px solid ${C.g200}`, marginBottom: 20 }}>
@@ -1201,12 +1308,15 @@ export default function ETLPipelineApp() {
           </div>
           {(addTab==="csv"||addTab==="excel") && (
             <div>
-              <label style={{ display: "block", border: `2px dashed ${uploadFile?C.blue:C.g300}`, borderRadius: 10, padding: "28px 20px", textAlign: "center", background: uploadFile?C.blueTint:C.g50, cursor: "pointer", marginBottom: 14 }}>
+              <label style={{ display: "block", border: `2px dashed ${uploadFile?C.blue:C.g300}`, borderRadius: 10, padding: "24px 20px", textAlign: "center", background: uploadFile?C.blueTint:C.g50, cursor: "pointer", marginBottom: 12 }}>
                 <input type="file" accept={addTab==="csv"?".csv":".xlsx,.xls"} onChange={e=>{setUploadFile(e.target.files[0]);setUploadName(e.target.files[0]?.name||"");}} style={{display:"none"}}/>
                 <div style={{fontSize:26,marginBottom:6}}>{uploadFile?"✅":"📁"}</div>
                 <div style={{fontWeight:700,color:uploadFile?C.blue:C.g600,fontSize:13}}>{uploadFile?uploadFile.name:`Drop your ${addTab.toUpperCase()} file here`}</div>
                 <div style={{fontSize:11,color:C.g400,marginTop:3}}>{uploadFile?`${(uploadFile.size/1024).toFixed(1)} KB`:"or click to browse"}</div>
               </label>
+              <div style={{ background: C.sparkTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.spark, marginBottom: 12 }}>
+                ⚡ Files larger than 10GB will be automatically converted to Parquet format
+              </div>
               <input value={uploadName} onChange={e=>setUploadName(e.target.value)} placeholder="Dataset name (optional)" style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${C.g200}`,fontSize:13,boxSizing:"border-box",outline:"none",color:C.g700}}/>
             </div>
           )}
@@ -1229,22 +1339,26 @@ export default function ETLPipelineApp() {
         </Modal>
       )}
 
-      {/* ════ NEW WORKFLOW MODAL ════ */}
+      {/* NEW WORKFLOW MODAL */}
       {showNewWfModal && (
         <Modal title="Create New Workflow" onClose={() => setShowNewWfModal(false)}>
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Workflow Name <span style={{ color: C.red }}>*</span></div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Workflow Name * <span style={{ fontSize: 10, color: C.g400, fontWeight: 400 }}>(= Pipeline / DAG name)</span></div>
               <input value={newWfForm.name} onChange={e => setNewWfForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Sales ETL Pipeline" style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${newWfForm.name ? C.blue : C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700 }} />
             </div>
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Description</div>
-              <textarea value={newWfForm.description} onChange={e => setNewWfForm(f => ({ ...f, description: e.target.value }))} placeholder="Describe what this pipeline does..." rows={3} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, resize: "none", fontFamily: "'DM Sans',sans-serif" }} />
+              <textarea value={newWfForm.description} onChange={e => setNewWfForm(f => ({ ...f, description: e.target.value }))} placeholder="Describe this pipeline..." rows={2} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, resize: "none" }} />
+            </div>
+            <div style={{ background: C.sparkTint, borderRadius: 8, padding: 12, fontSize: 11, color: C.spark, lineHeight: 1.6 }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>⚡ Spark Features Enabled</div>
+              Auto resource sizing · Dynamic allocation · Parquet output · Multi-branch tasks (add multiple Output Dataset nodes)
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
             <button onClick={() => setShowNewWfModal(false)} style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
-            <button onClick={createWorkflow} disabled={!newWfForm.name.trim()} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !newWfForm.name.trim() ? C.g300 : `linear-gradient(90deg,${C.blue},${C.blueMid})`, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !newWfForm.name.trim() ? "not-allowed" : "pointer" }}>
+            <button onClick={createWorkflow} disabled={!newWfForm.name.trim()} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !newWfForm.name.trim() ? C.g300 : `linear-gradient(135deg,${C.spark},${C.blue})`, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !newWfForm.name.trim() ? "not-allowed" : "pointer" }}>
               Create & Open Editor
             </button>
           </div>

@@ -59,58 +59,71 @@ export function computeNodeColumns(nodes, edges) {
 export function applyColumnTransform(type, config, inputCols) {
   if (!inputCols || inputCols.length === 0) return [];
 
+  // Helper untuk extract nama kolom
+  const getColName = (c) => typeof c === 'object' ? c.name : c;
+  const normalizeCols = (cols) => cols.map(getColName);
+  const normalized = normalizeCols(inputCols);
+
   switch (type) {
     case "select_col": {
-      const selected = (config?.columns || []).filter(c => inputCols.includes(c));
-      return selected.length > 0 ? selected : inputCols;
+      const selected = (config?.columns || []).filter(c => normalized.includes(getColName(c)));
+      return selected.length > 0 ? selected : normalized;
     }
 
     case "drop_col": {
-      const drop = new Set(config?.columns || []);
-      return inputCols.filter(c => !drop.has(c));
+      const drop = new Set((config?.columns || []).map(c => getColName(c)));
+      return normalized.filter(c => !drop.has(c));
     }
 
     case "rename_col": {
       const renames = config?.renames || {};
-      return inputCols.map(c => renames[c] || c);
+      return normalized.map(c => {
+        // Cari apakah ada rename untuk kolom ini
+        const rename = renames.find(r => r.old_name === c);
+        return rename ? rename.new_name : c;
+      });
     }
 
     case "add_const": {
-      const name = config?.name;
-      return name ? [...inputCols, name] : inputCols;
+      const name = config?.name || config?.columnName;
+      return name ? [...normalized, name] : normalized;
+    }
+
+    case "set_val": {
+      // Set value tidak menambah kolom baru, hanya mengubah value
+      return normalized;
     }
 
     case "val_mapper": {
-      const newCol = config?.newColName;
-      return newCol ? [...inputCols, newCol] : inputCols;
+      const newCol = config?.newColName || config?.output_column;
+      return newCol ? [...normalized, newCol] : normalized;
     }
 
     case "group_agg": {
-      const groupCols = (config?.groupCols || []).filter(c => inputCols.includes(c));
+      const groupCols = (config?.groupCols || []).filter(c => normalized.includes(getColName(c)));
       const aggAliases = (config?.aggCols || []).map(a => a.alias).filter(Boolean);
       return [...groupCols, ...aggAliases];
     }
 
     case "join_data": {
-      // Join adds columns from both — simplified: just pass through
-      return inputCols;
+      // Join adds columns dari kedua tabel (simplifikasi: pass through saja)
+      return normalized;
     }
 
     case "change_type":
     case "fill_null":
     case "filter_rows":
     case "order_table":
-    case "set_val":
     case "pyspark":
     default:
-      return inputCols;
+      return normalized;
   }
 }
 
 /**
  * Simple topological sort of nodes based on edges.
  */
-function topoSort(nodes, edges) {
+export function topoSort(nodes, edges) {
   const inDegree = {};
   const graph    = {};
 
@@ -144,4 +157,52 @@ export function getUpstreamColumns(nodeId, nodes, edges) {
   const sourceEdge = edges.find(e => e.target === nodeId);
   if (!sourceEdge) return [];
   return colMap[sourceEdge.source] || [];
+}
+
+/**
+ * Validasi apakah koneksi antar node valid berdasarkan jenis node
+ * @param {string} sourceType - Tipe node sumber
+ * @param {string} targetType - Tipe node tujuan
+ * @returns {boolean} - True jika koneksi valid
+ */
+export function isValidNodeConnection(sourceType, targetType) {
+  // Definisikan semua tipe utility node
+  const utilityTypes = ["select_col", "rename_col", "drop_col", "add_const", "set_val", "val_mapper", "change_type", "fill_null", "filter_rows", "order_table", "group_agg", "join_data", "pyspark"];
+
+  // Output dataset tidak boleh mengeluarkan koneksi
+  if (sourceType === "output_dataset") {
+    return false;
+  }
+
+  // Input dataset dapat terhubung ke utility dan output dataset
+  if (sourceType === "input_dataset") {
+    return utilityTypes.includes(targetType) || targetType === "output_dataset";
+  }
+
+  // Utility nodes dapat terhubung ke utility atau output dataset
+  if (utilityTypes.includes(sourceType)) {
+    return utilityTypes.includes(targetType) || targetType === "output_dataset";
+  }
+
+  return false;
+}
+
+/**
+ * Cek apakah kolom dari upstream sudah siap untuk digunakan di utility node
+ * @param {Array} upstreamColumns - Kolom dari node upstream
+ * @returns {boolean} - True jika ada kolom yang tersedia
+ */
+export function isColumnAvailable(upstreamColumns) {
+  return Array.isArray(upstreamColumns) && upstreamColumns.length > 0;
+}
+
+/**
+ * Ambil nama kolom dari data kolom (bisa string atau object)
+ * @param {string|object} column - Data kolom
+ * @returns {string} - Nama kolom
+ */
+export function getColumnName(column) {
+  if (typeof column === "string") return column;
+  if (typeof column === "object" && column.name) return column.name;
+  return String(column);
 }

@@ -1,6 +1,6 @@
 // UtilityConfigs.jsx
-// Drop-in replacement for utility node configuration modals
-// Import and use: <UtilityConfigModal node={node} columns={columns} onSave={fn} onClose={fn} />
+// Drop-in replacement for utility node configuration sidebars
+// Import and use: <UtilityConfigSidebar node={node} columns={columns} onSave={fn} onClose={fn} />
 
 import { useState, useEffect } from "react";
 
@@ -66,13 +66,11 @@ function ColumnPicker({ columns, selected, onAdd, onRemove, onAddAll, onRemoveAl
 
   return (
     <div>
-      {/* Selected tags */}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 8, minHeight: 28 }}>
         {selected.length === 0 && <span style={{ fontSize: 11, color: C.g400, fontStyle: "italic" }}>No columns selected</span>}
         {selected.map(c => <Tag key={c} label={c} onRemove={() => onRemove(c)} />)}
       </div>
 
-      {/* Controls */}
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
         <div style={{ position: "relative" }}>
           <button onClick={() => setOpen(v => !v)} style={{ padding: "5px 10px", borderRadius: 6, border: `1px solid ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
@@ -110,7 +108,7 @@ function ColumnPicker({ columns, selected, onAdd, onRemove, onAddAll, onRemoveAl
 
 function SaveBar({ onSave, onClose, disabled = false }) {
   return (
-    <div style={{ display: "flex", gap: 8, marginTop: 20, paddingTop: 16, borderTop: `1px solid ${C.g200}` }}>
+    <div style={{ display: "flex", gap: 8, marginTop: "auto", paddingTop: 16, borderTop: `1px solid ${C.g200}` }}>
       <button onClick={onClose} style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
       <button onClick={onSave} disabled={disabled} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: disabled ? C.g300 : `linear-gradient(90deg,${C.blue},${C.blueMid})`, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer" }}>
         Save Configuration
@@ -119,112 +117,111 @@ function SaveBar({ onSave, onClose, disabled = false }) {
   );
 }
 
-// ── 1. Add Constant ───────────────────────────────────────────────────────────
+// ── Configuration Components ──────────────────────────────────────────────────
+// (Kode komponen configurasi di bawah ini sama seperti sebelumnya)
 function AddConstantConfig({ config, onSave, onClose }) {
   const [name,  setName]  = useState(config?.name  || "");
   const [value, setValue] = useState(config?.value || "");
   const [dtype, setDtype] = useState(config?.dtype || "TEXT");
 
   return (
-    <div>
-      <p style={{ fontSize: 12, color: C.g500, marginBottom: 16, lineHeight: 1.6 }}>
-        Add a new column with a constant value to your dataset.
-      </p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <p style={{ fontSize: 12, color: C.g500, marginBottom: 16, lineHeight: 1.6 }}>Add a new column with a constant value to your dataset.</p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
         <div><Label required>Column Name</Label><Input value={name} onChange={setName} placeholder="e.g. country" /></div>
         <div><Label required>Constant Value</Label><Input value={value} onChange={setValue} placeholder='e.g. "Indonesia" or 1' /></div>
         <div><Label required>Data Type</Label><Select value={dtype} onChange={setDtype} options={DATA_TYPES} /></div>
+        {name && value && (
+          <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue }}>
+            Preview: <code style={{ fontFamily: "monospace" }}>{name} = {value} ({dtype})</code>
+          </div>
+        )}
       </div>
-      {name && value && (
-        <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue }}>
-          Preview: <code style={{ fontFamily: "monospace" }}>{name} = {value} ({dtype})</code>
-        </div>
-      )}
       <SaveBar onSave={() => onSave({ name, value, dtype })} onClose={onClose} disabled={!name || !value} />
     </div>
   );
 }
 
-// ── 2. Select Column ──────────────────────────────────────────────────────────
 function SelectColumnConfig({ columns, config, onSave, onClose }) {
   const [selected, setSelected] = useState(config?.columns || []);
   const add = (c) => !selected.includes(c) && setSelected(s => [...s, c]);
   const remove = (c) => setSelected(s => s.filter(x => x !== c));
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Select columns to keep in the output.</p>
-      <Label required>Columns to Select</Label>
-      <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => setSelected([])} />
-      {selected.length > 0 && (
-        <div style={{ marginTop: 10, background: C.greenTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.green }}>
-          ✓ {selected.length} column{selected.length > 1 ? "s" : ""} selected: {selected.join(", ")}
-        </div>
-      )}
+      <div style={{ flex: 1 }}>
+        <Label required>Columns to Select</Label>
+        <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => setSelected([])} />
+        {selected.length > 0 && (
+          <div style={{ marginTop: 10, background: C.greenTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.green }}>
+            ✓ {selected.length} column{selected.length > 1 ? "s" : ""} selected: {selected.join(", ")}
+          </div>
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ columns: selected })} onClose={onClose} disabled={selected.length === 0} />
     </div>
   );
 }
 
-// ── 3. Rename Columns ─────────────────────────────────────────────────────────
 function RenameColumnsConfig({ columns, config, onSave, onClose }) {
   const [selected, setSelected] = useState(Object.keys(config?.renames || {}));
   const [renames,  setRenames]  = useState(config?.renames || {});
 
-  const add = (c) => {
-    if (!selected.includes(c)) { setSelected(s => [...s, c]); setRenames(r => ({ ...r, [c]: r[c] || "" })); }
-  };
+  const add = (c) => { if (!selected.includes(c)) { setSelected(s => [...s, c]); setRenames(r => ({ ...r, [c]: r[c] || "" })); }};
   const remove = (c) => { setSelected(s => s.filter(x => x !== c)); setRenames(r => { const n = { ...r }; delete n[c]; return n; }); };
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Select columns and provide new names.</p>
-      <Label required>Select Columns</Label>
-      <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => { setSelected([]); setRenames({}); }} />
-      {selected.length > 0 && (
-        <div style={{ marginTop: 14 }}>
-          <Label>New Column Names</Label>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {selected.map(c => (
-              <div key={c} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <div style={{ flex: 1, padding: "7px 10px", borderRadius: 7, background: C.g100, fontSize: 12, color: C.g600, fontFamily: "monospace" }}>{c}</div>
-                <span style={{ color: C.g400, fontSize: 12 }}>→</span>
-                <div style={{ flex: 1 }}>
-                  <input value={renames[c] || ""} onChange={e => setRenames(r => ({ ...r, [c]: e.target.value }))} placeholder={`new name for ${c}`}
-                    style={{ width: "100%", padding: "7px 10px", borderRadius: 7, border: `1px solid ${C.g200}`, fontSize: 12, outline: "none", color: C.g700, boxSizing: "border-box", fontFamily: "monospace" }} />
+      <div style={{ flex: 1 }}>
+        <Label required>Select Columns</Label>
+        <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => { setSelected([]); setRenames({}); }} />
+        {selected.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <Label>New Column Names</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {selected.map(c => (
+                <div key={c} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ flex: 1, padding: "7px 10px", borderRadius: 7, background: C.g100, fontSize: 12, color: C.g600, fontFamily: "monospace" }}>{c}</div>
+                  <span style={{ color: C.g400, fontSize: 12 }}>→</span>
+                  <div style={{ flex: 1 }}>
+                    <input value={renames[c] || ""} onChange={e => setRenames(r => ({ ...r, [c]: e.target.value }))} placeholder={`new name`}
+                      style={{ width: "100%", padding: "7px 10px", borderRadius: 7, border: `1px solid ${C.g200}`, fontSize: 12, outline: "none", color: C.g700, boxSizing: "border-box", fontFamily: "monospace" }} />
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ renames })} onClose={onClose} disabled={selected.length === 0 || selected.some(c => !renames[c])} />
     </div>
   );
 }
 
-// ── 4. Drop Columns ───────────────────────────────────────────────────────────
 function DropColumnsConfig({ columns, config, onSave, onClose }) {
   const [selected, setSelected] = useState(config?.columns || []);
   const add = (c) => !selected.includes(c) && setSelected(s => [...s, c]);
   const remove = (c) => setSelected(s => s.filter(x => x !== c));
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Select columns to <strong>remove</strong> from the dataset.</p>
-      <Label required>Columns to Drop</Label>
-      <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => setSelected([])} />
-      {selected.length > 0 && (
-        <div style={{ marginTop: 10, background: C.redTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.red }}>
-          ⚠ Will remove: {selected.join(", ")}
-        </div>
-      )}
+      <div style={{ flex: 1 }}>
+        <Label required>Columns to Drop</Label>
+        <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => setSelected([])} />
+        {selected.length > 0 && (
+          <div style={{ marginTop: 10, background: C.redTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.red }}>
+            ⚠ Will remove: {selected.join(", ")}
+          </div>
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ columns: selected })} onClose={onClose} disabled={selected.length === 0} />
     </div>
   );
 }
 
-// ── 5 & 13. Order Table ───────────────────────────────────────────────────────
 function OrderTableConfig({ columns, config, onSave, onClose }) {
   const [orders, setOrders] = useState(config?.orders || []); // [{col, dir}]
   const [open,   setOpen]   = useState(false);
@@ -236,53 +233,53 @@ function OrderTableConfig({ columns, config, onSave, onClose }) {
   const setDir = (c, dir) => setOrders(o => o.map(x => x.col === c ? { ...x, dir } : x));
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Choose columns to sort by and set the order direction.</p>
-      <Label required>Sort Columns</Label>
+      <div style={{ flex: 1 }}>
+        <Label required>Sort Columns</Label>
+        {orders.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 10 }}>
+            {orders.map((o, i) => (
+              <div key={o.col} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 18, height: 18, borderRadius: "50%", background: C.blue, color: C.white, fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i+1}</span>
+                <div style={{ flex: 1, padding: "6px 10px", borderRadius: 7, background: C.g100, fontSize: 12, color: C.g700, fontFamily: "monospace" }}>{o.col}</div>
+                <select value={o.dir} onChange={e => setDir(o.col, e.target.value)}
+                  style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.g200}`, fontSize: 11, fontWeight: 700, color: o.dir === "ASC" ? C.green : C.orange, background: C.white, width: 76 }}>
+                  {ORDER_DIRS.map(d => <option key={d}>{d}</option>)}
+                </select>
+                <button onClick={() => removeCol(o.col)} style={{ background: C.redTint, border: "none", borderRadius: 6, width: 24, height: 24, cursor: "pointer", color: C.red, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>×</button>
+              </div>
+            ))}
+          </div>
+        )}
 
-      {orders.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 10 }}>
-          {orders.map((o, i) => (
-            <div key={o.col} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ width: 18, height: 18, borderRadius: "50%", background: C.blue, color: C.white, fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{i+1}</span>
-              <div style={{ flex: 1, padding: "6px 10px", borderRadius: 7, background: C.g100, fontSize: 12, color: C.g700, fontFamily: "monospace" }}>{o.col}</div>
-              <select value={o.dir} onChange={e => setDir(o.col, e.target.value)}
-                style={{ padding: "6px 8px", borderRadius: 7, border: `1px solid ${C.g200}`, fontSize: 11, fontWeight: 700, color: o.dir === "ASC" ? C.green : C.orange, background: C.white, width: 76 }}>
-                {ORDER_DIRS.map(d => <option key={d}>{d}</option>)}
-              </select>
-              <button onClick={() => removeCol(o.col)} style={{ background: C.redTint, border: "none", borderRadius: 6, width: 24, height: 24, cursor: "pointer", color: C.red, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>×</button>
+        <div style={{ position: "relative", display: "inline-block" }}>
+          <button onClick={() => setOpen(v => !v)} style={{ padding: "5px 10px", borderRadius: 6, border: `1px solid ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+ Add Column</button>
+          {open && (
+            <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, boxShadow: "0 4px 16px rgba(0,0,0,.12)", maxHeight: 160, overflowY: "auto", minWidth: 180, marginTop: 3 }}>
+              {available.length === 0
+                ? <div style={{ padding: "10px 14px", fontSize: 11, color: C.g400 }}>All columns added</div>
+                : available.map(c => (
+                  <button key={c} onClick={() => { addCol(c); setOpen(false); }}
+                    style={{ width: "100%", padding: "7px 14px", background: "none", border: "none", textAlign: "left", fontSize: 12, cursor: "pointer", color: C.g700 }}
+                    onMouseEnter={e => e.currentTarget.style.background = C.g50}
+                    onMouseLeave={e => e.currentTarget.style.background = "none"}>{c}</button>
+                ))}
             </div>
-          ))}
+          )}
         </div>
-      )}
 
-      <div style={{ position: "relative", display: "inline-block" }}>
-        <button onClick={() => setOpen(v => !v)} style={{ padding: "5px 10px", borderRadius: 6, border: `1px solid ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>+ Add Column</button>
-        {open && (
-          <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, boxShadow: "0 4px 16px rgba(0,0,0,.12)", maxHeight: 160, overflowY: "auto", minWidth: 180, marginTop: 3 }}>
-            {available.length === 0
-              ? <div style={{ padding: "10px 14px", fontSize: 11, color: C.g400 }}>All columns added</div>
-              : available.map(c => (
-                <button key={c} onClick={() => { addCol(c); setOpen(false); }}
-                  style={{ width: "100%", padding: "7px 14px", background: "none", border: "none", textAlign: "left", fontSize: 12, cursor: "pointer", color: C.g700 }}
-                  onMouseEnter={e => e.currentTarget.style.background = C.g50}
-                  onMouseLeave={e => e.currentTarget.style.background = "none"}>{c}</button>
-              ))}
+        {orders.length > 0 && (
+          <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue }}>
+            ORDER BY {orders.map(o => `${o.col} ${o.dir}`).join(", ")}
           </div>
         )}
       </div>
-
-      {orders.length > 0 && (
-        <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue }}>
-          ORDER BY {orders.map(o => `${o.col} ${o.dir}`).join(", ")}
-        </div>
-      )}
       <SaveBar onSave={() => onSave({ orders })} onClose={onClose} disabled={orders.length === 0} />
     </div>
   );
 }
 
-// ── 6. Change Column Data Type ────────────────────────────────────────────────
 function ChangeDataTypeConfig({ columns, config, onSave, onClose }) {
   const [selected, setSelected] = useState(Object.keys(config?.types || {}));
   const [types,    setTypes]    = useState(config?.types || {});
@@ -291,33 +288,34 @@ function ChangeDataTypeConfig({ columns, config, onSave, onClose }) {
   const remove = (c) => { setSelected(s => s.filter(x => x !== c)); setTypes(t => { const n = { ...t }; delete n[c]; return n; }); };
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Select columns and choose the new data type for each.</p>
-      <Label required>Select Columns</Label>
-      <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => { setSelected([]); setTypes({}); }} />
-      {selected.length > 0 && (
-        <div style={{ marginTop: 14 }}>
-          <Label>New Data Types</Label>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {selected.map(c => (
-              <div key={c} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <div style={{ flex: 1, padding: "7px 10px", borderRadius: 7, background: C.g100, fontSize: 12, color: C.g600, fontFamily: "monospace" }}>{c}</div>
-                <span style={{ color: C.g400, fontSize: 12 }}>→</span>
-                <select value={types[c] || "TEXT"} onChange={e => setTypes(t => ({ ...t, [c]: e.target.value }))}
-                  style={{ flex: 1, padding: "7px 10px", borderRadius: 7, border: `1px solid ${C.g200}`, fontSize: 12, outline: "none", color: C.blue, fontWeight: 700, background: C.white }}>
-                  {DATA_TYPES.map(d => <option key={d}>{d}</option>)}
-                </select>
-              </div>
-            ))}
+      <div style={{ flex: 1 }}>
+        <Label required>Select Columns</Label>
+        <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => { setSelected([]); setTypes({}); }} />
+        {selected.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <Label>New Data Types</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {selected.map(c => (
+                <div key={c} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ flex: 1, padding: "7px 10px", borderRadius: 7, background: C.g100, fontSize: 12, color: C.g600, fontFamily: "monospace" }}>{c}</div>
+                  <span style={{ color: C.g400, fontSize: 12 }}>→</span>
+                  <select value={types[c] || "TEXT"} onChange={e => setTypes(t => ({ ...t, [c]: e.target.value }))}
+                    style={{ flex: 1, padding: "7px 10px", borderRadius: 7, border: `1px solid ${C.g200}`, fontSize: 12, outline: "none", color: C.blue, fontWeight: 700, background: C.white }}>
+                    {DATA_TYPES.map(d => <option key={d}>{d}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ types })} onClose={onClose} disabled={selected.length === 0} />
     </div>
   );
 }
 
-// ── 7. Set Column Value ───────────────────────────────────────────────────────
 function SetColumnValueConfig({ columns, config, onSave, onClose }) {
   const [targetCol, setTargetCol] = useState(config?.targetCol || "");
   const [sourceCol, setSourceCol] = useState(config?.sourceCol || "");
@@ -325,9 +323,9 @@ function SetColumnValueConfig({ columns, config, onSave, onClose }) {
   const [expr,      setExpr]      = useState(config?.expr || "");
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Replace the value of a column with another column's value or an expression.</p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
         <div><Label required>Target Column (to replace)</Label><Select value={targetCol} onChange={setTargetCol} options={columns} placeholder="— Select column —" /></div>
         <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
           <button onClick={() => setUseExpr(false)} style={{ flex: 1, padding: "7px 0", borderRadius: 7, border: `1px solid ${!useExpr ? C.blue : C.g200}`, background: !useExpr ? C.blueTint : C.white, color: !useExpr ? C.blue : C.g500, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>From Column</button>
@@ -337,18 +335,17 @@ function SetColumnValueConfig({ columns, config, onSave, onClose }) {
           ? <div><Label required>Source Column (value to use)</Label><Select value={sourceCol} onChange={setSourceCol} options={columns.filter(c => c !== targetCol)} placeholder="— Select column —" /></div>
           : <div><Label required>SQL Expression</Label><Input value={expr} onChange={setExpr} placeholder="e.g. UPPER(name) or price * 1.1" mono /></div>
         }
+        {targetCol && (sourceCol || expr) && (
+          <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue, fontFamily: "monospace" }}>
+            UPDATE {targetCol} = {useExpr ? expr : sourceCol}
+          </div>
+        )}
       </div>
-      {targetCol && (sourceCol || expr) && (
-        <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue, fontFamily: "monospace" }}>
-          UPDATE {targetCol} = {useExpr ? expr : sourceCol}
-        </div>
-      )}
       <SaveBar onSave={() => onSave({ targetCol, sourceCol, useExpr, expr })} onClose={onClose} disabled={!targetCol || (!sourceCol && !expr)} />
     </div>
   );
 }
 
-// ── 8. Value Mapper ───────────────────────────────────────────────────────────
 function ValueMapperConfig({ columns, config, onSave, onClose }) {
   const [sourceCol,  setSourceCol]  = useState(config?.sourceCol  || "");
   const [newColName, setNewColName] = useState(config?.newColName || "");
@@ -362,17 +359,14 @@ function ValueMapperConfig({ columns, config, onSave, onClose }) {
   const preview = whens.every(w => w.value && w.result) && newColName && elseValue;
 
   return (
-    <div>
-      <p style={{ fontSize: 12, color: C.g500, marginBottom: 16, lineHeight: 1.6 }}>
-        Map values to a new column using conditional logic (like SQL CASE WHEN).
-      </p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <p style={{ fontSize: 12, color: C.g500, marginBottom: 16, lineHeight: 1.6 }}>Map values to a new column using conditional logic.</p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, flex: 1, overflowY: "auto", paddingRight: 4 }}>
         <div style={{ display: "flex", gap: 10 }}>
           <div style={{ flex: 1 }}><Label required>Source Column</Label><Select value={sourceCol} onChange={setSourceCol} options={columns} placeholder="— Select —" /></div>
           <div style={{ flex: 1 }}><Label required>New Column Name</Label><Input value={newColName} onChange={setNewColName} placeholder="e.g. member_level" /></div>
         </div>
 
-        {/* WHEN conditions */}
         <div>
           <Label required>Conditions</Label>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -420,36 +414,34 @@ function ValueMapperConfig({ columns, config, onSave, onClose }) {
         </div>
 
         <div><Label required>ELSE Value</Label><Input value={elseValue} onChange={setElseValue} placeholder="e.g. bronze (default if no condition matches)" /></div>
-      </div>
 
-      {/* SQL Preview */}
-      {preview && (
-        <div style={{ marginTop: 12, background: C.g800 || "#1e293b", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 11, color: "#93c5fd", lineHeight: 1.7 }}>
-          <div style={{ color: C.g400, fontSize: 10, marginBottom: 4 }}>SQL Preview</div>
-          CASE<br/>
-          {whens.map((w, i) => <span key={i}>&nbsp;&nbsp;{i > 0 ? w.logic : "WHEN"} {sourceCol} {w.condition} '{w.value}' THEN '{w.result}'<br/></span>)}
-          &nbsp;&nbsp;ELSE '{elseValue}'<br/>
-          END AS {newColName}
-        </div>
-      )}
+        {preview && (
+          <div style={{ marginTop: 12, background: C.g800 || "#1e293b", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 11, color: "#93c5fd", lineHeight: 1.7 }}>
+            <div style={{ color: C.g400, fontSize: 10, marginBottom: 4 }}>SQL Preview</div>
+            CASE<br/>
+            {whens.map((w, i) => <span key={i}>&nbsp;&nbsp;{i > 0 ? w.logic : "WHEN"} {sourceCol} {w.condition} '{w.value}' THEN '{w.result}'<br/></span>)}
+            &nbsp;&nbsp;ELSE '{elseValue}'<br/>
+            END AS {newColName}
+          </div>
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ sourceCol, newColName, elseValue, whens })} onClose={onClose} disabled={!sourceCol || !newColName || !elseValue || whens.some(w => !w.value || !w.result)} />
     </div>
   );
 }
 
-// ── 9. Fill NULL ──────────────────────────────────────────────────────────────
 function FillNullConfig({ columns, config, onSave, onClose }) {
   const [selected, setSelected] = useState(config?.columns || []);
   const [fillValue, setFillValue] = useState(config?.fillValue || "");
-  const [fillType,  setFillType]  = useState(config?.fillType  || "value"); // value | mean | median | mode | forward | backward
+  const [fillType,  setFillType]  = useState(config?.fillType  || "value"); 
 
   const add = (c) => !selected.includes(c) && setSelected(s => [...s, c]);
   const remove = (c) => setSelected(s => s.filter(x => x !== c));
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Replace NULL values in selected columns.</p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
         <div>
           <Label required>Select Columns</Label>
           <ColumnPicker columns={columns} selected={selected} onAdd={add} onRemove={remove} onAddAll={() => columns.forEach(add)} onRemoveAll={() => setSelected([])} />
@@ -465,18 +457,17 @@ function FillNullConfig({ columns, config, onSave, onClose }) {
         {fillType === "value" && (
           <div><Label required>Fill Value</Label><Input value={fillValue} onChange={setFillValue} placeholder='e.g. 0 or "Unknown"' /></div>
         )}
+        {selected.length > 0 && (
+          <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue }}>
+            Fill NULL in [{selected.join(", ")}] with {fillType === "value" ? `"${fillValue}"` : fillType}
+          </div>
+        )}
       </div>
-      {selected.length > 0 && (
-        <div style={{ marginTop: 12, background: C.blueTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.blue }}>
-          Fill NULL in [{selected.join(", ")}] with {fillType === "value" ? `"${fillValue}"` : fillType}
-        </div>
-      )}
       <SaveBar onSave={() => onSave({ columns: selected, fillValue, fillType })} onClose={onClose} disabled={selected.length === 0 || (fillType === "value" && !fillValue)} />
     </div>
   );
 }
 
-// ── 10. Filter Rows ───────────────────────────────────────────────────────────
 function FilterRowsConfig({ columns, config, onSave, onClose }) {
   const [formula,   setFormula]   = useState(config?.formula || "");
   const [error,     setError]     = useState("");
@@ -484,7 +475,6 @@ function FilterRowsConfig({ columns, config, onSave, onClose }) {
 
   const validate = () => {
     if (!formula.trim()) { setError("Formula cannot be empty"); setValidated(false); return; }
-    // Basic validation: check for dangerous SQL
     const dangerous = ["DROP","DELETE","INSERT","UPDATE","TRUNCATE","ALTER","CREATE","EXEC","EXECUTE"];
     const upper = formula.toUpperCase();
     if (dangerous.some(d => upper.includes(d))) { setError("Dangerous SQL keywords detected"); setValidated(false); return; }
@@ -493,41 +483,39 @@ function FilterRowsConfig({ columns, config, onSave, onClose }) {
   };
 
   return (
-    <div>
-      <p style={{ fontSize: 12, color: C.g500, marginBottom: 12, lineHeight: 1.6 }}>
-        Filter rows using a SQL WHERE clause condition. Rows where the condition is TRUE will be kept.
-      </p>
-      <div style={{ marginBottom: 10 }}>
-        <Label required>Filter Formula (SQL WHERE clause)</Label>
-        <textarea value={formula} onChange={e => { setFormula(e.target.value); setValidated(false); setError(""); }} placeholder={"e.g. age > 18\nor: city = 'Jakarta' AND salary >= 5000000\nor: child_no < 2 OR child_no IS NULL"}
-          rows={4} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${error ? C.red : validated ? C.green : C.g200}`, fontSize: 12, boxSizing: "border-box", outline: "none", color: C.g700, resize: "vertical", fontFamily: "monospace", lineHeight: 1.7 }} />
-        {error    && <div style={{ marginTop: 5, fontSize: 11, color: C.red   }}>❌ {error}</div>}
-        {validated && <div style={{ marginTop: 5, fontSize: 11, color: C.green }}>✓ Formula looks valid</div>}
-      </div>
-
-      {/* Column helpers */}
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ fontSize: 11, color: C.g400, marginBottom: 6 }}>Available columns (click to insert):</div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-          {columns.map(c => (
-            <button key={c} onClick={() => setFormula(f => f + (f ? " AND " : "") + c)} style={{ padding: "3px 9px", borderRadius: 5, border: `1px solid ${C.g200}`, background: C.g50, color: C.g600, fontSize: 11, cursor: "pointer", fontFamily: "monospace" }}>{c}</button>
-          ))}
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <p style={{ fontSize: 12, color: C.g500, marginBottom: 12, lineHeight: 1.6 }}>Filter rows using a SQL WHERE clause condition.</p>
+      <div style={{ flex: 1 }}>
+        <div style={{ marginBottom: 10 }}>
+          <Label required>Filter Formula (SQL WHERE clause)</Label>
+          <textarea value={formula} onChange={e => { setFormula(e.target.value); setValidated(false); setError(""); }} placeholder={"e.g. age > 18\nor: city = 'Jakarta' AND salary >= 5000000\nor: child_no < 2 OR child_no IS NULL"}
+            rows={4} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: `1.5px solid ${error ? C.red : validated ? C.green : C.g200}`, fontSize: 12, boxSizing: "border-box", outline: "none", color: C.g700, resize: "vertical", fontFamily: "monospace", lineHeight: 1.7 }} />
+          {error    && <div style={{ marginTop: 5, fontSize: 11, color: C.red   }}>❌ {error}</div>}
+          {validated && <div style={{ marginTop: 5, fontSize: 11, color: C.green }}>✓ Formula looks valid</div>}
         </div>
-      </div>
 
-      <button onClick={validate} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 12, fontWeight: 700, cursor: "pointer", marginBottom: 4 }}>
-        Validate Formula
-      </button>
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: C.g400, marginBottom: 6 }}>Available columns (click to insert):</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+            {columns.map(c => (
+              <button key={c} onClick={() => setFormula(f => f + (f ? " AND " : "") + c)} style={{ padding: "3px 9px", borderRadius: 5, border: `1px solid ${C.g200}`, background: C.g50, color: C.g600, fontSize: 11, cursor: "pointer", fontFamily: "monospace" }}>{c}</button>
+            ))}
+          </div>
+        </div>
+
+        <button onClick={validate} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${C.blue}`, background: C.blueTint, color: C.blue, fontSize: 12, fontWeight: 700, cursor: "pointer", marginBottom: 4 }}>
+          Validate Formula
+        </button>
+      </div>
 
       <SaveBar onSave={() => onSave({ formula })} onClose={onClose} disabled={!formula || !!error} />
     </div>
   );
 }
 
-// ── 11. Group By & Aggregate ──────────────────────────────────────────────────
 function GroupByAggConfig({ columns, config, onSave, onClose }) {
   const [groupCols, setGroupCols] = useState(config?.groupCols || []);
-  const [aggCols,   setAggCols]   = useState(config?.aggCols   || []); // [{col, func, alias}]
+  const [aggCols,   setAggCols]   = useState(config?.aggCols   || []); 
   const [openGroup, setOpenGroup] = useState(false);
   const [openAgg,   setOpenAgg]   = useState(false);
 
@@ -538,9 +526,9 @@ function GroupByAggConfig({ columns, config, onSave, onClose }) {
   const updateAgg = (i, field, val) => setAggCols(a => a.map((x, idx) => idx === i ? { ...x, [field]: val } : x));
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16 }}>Group data by columns and compute aggregations.</p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14, flex: 1, overflowY: "auto", paddingRight: 4 }}>
         <div>
           <Label required>Group By Columns</Label>
           <ColumnPicker columns={columns} selected={groupCols} onAdd={addGroup} onRemove={removeGroup} onAddAll={() => columns.forEach(addGroup)} onRemoveAll={() => setGroupCols([])} />
@@ -578,40 +566,37 @@ function GroupByAggConfig({ columns, config, onSave, onClose }) {
             )}
           </div>
         </div>
-      </div>
 
-      {/* SQL Preview */}
-      {groupCols.length > 0 && aggCols.length > 0 && (
-        <div style={{ marginTop: 12, background: "#1e293b", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 11, color: "#93c5fd", lineHeight: 1.8 }}>
-          <div style={{ color: C.g400, fontSize: 10, marginBottom: 4 }}>SQL Preview</div>
-          SELECT {groupCols.join(", ")}, {aggCols.map(a => `${a.func}(${a.col}) AS ${a.alias}`).join(", ")}<br/>
-          FROM table<br/>
-          GROUP BY {groupCols.join(", ")}
-        </div>
-      )}
+        {groupCols.length > 0 && aggCols.length > 0 && (
+          <div style={{ marginTop: 12, background: "#1e293b", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 11, color: "#93c5fd", lineHeight: 1.8 }}>
+            <div style={{ color: C.g400, fontSize: 10, marginBottom: 4 }}>SQL Preview</div>
+            SELECT {groupCols.join(", ")}, {aggCols.map(a => `${a.func}(${a.col}) AS ${a.alias}`).join(", ")}<br/>
+            FROM table<br/>
+            GROUP BY {groupCols.join(", ")}
+          </div>
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ groupCols, aggCols })} onClose={onClose} disabled={groupCols.length === 0 || aggCols.length === 0} />
     </div>
   );
 }
 
-// ── 12. Join Data ─────────────────────────────────────────────────────────────
 function JoinDataConfig({ columns, config, onSave, onClose, allNodes }) {
   const [joinType,   setJoinType]   = useState(config?.joinType   || "INNER JOIN");
   const [leftCol,    setLeftCol]    = useState(config?.leftCol    || "");
   const [rightCol,   setRightCol]   = useState(config?.rightCol   || "");
   const [rightNodeId,setRightNodeId]= useState(config?.rightNodeId|| "");
 
-  // Get input dataset nodes (excluding this one)
   const inputNodes = (allNodes || []).filter(n => n.data?.type === "input_dataset" && n.data?.config?.dataset);
   const rightDataset = inputNodes.find(n => n.id === rightNodeId)?.data?.config?.dataset;
   const rightColumns = rightDataset?.columns || [];
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16, lineHeight: 1.6 }}>
         Join two datasets. Connect both Input Dataset nodes to this Join node. The first connected node is the <strong>left table</strong>.
       </p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, flex: 1 }}>
         <div>
           <Label required>Join Type</Label>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 6 }}>
@@ -633,22 +618,21 @@ function JoinDataConfig({ columns, config, onSave, onClose, allNodes }) {
           <div style={{ padding: "8px 0", color: C.g400, fontSize: 12, textAlign: "center" }}>=</div>
           <div><Label required>Right Table Column</Label><Select value={rightCol} onChange={setRightCol} options={rightColumns} placeholder="— Select —" /></div>
         </div>
-      </div>
 
-      {leftCol && rightCol && (
-        <div style={{ marginTop: 12, background: "#1e293b", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 11, color: "#93c5fd", lineHeight: 1.8 }}>
-          <div style={{ color: C.g400, fontSize: 10, marginBottom: 4 }}>SQL Preview</div>
-          FROM left_table<br/>
-          {joinType} right_table<br/>
-          ON left_table.{leftCol} = right_table.{rightCol}
-        </div>
-      )}
+        {leftCol && rightCol && (
+          <div style={{ marginTop: 12, background: "#1e293b", borderRadius: 8, padding: 12, fontFamily: "monospace", fontSize: 11, color: "#93c5fd", lineHeight: 1.8 }}>
+            <div style={{ color: C.g400, fontSize: 10, marginBottom: 4 }}>SQL Preview</div>
+            FROM left_table<br/>
+            {joinType} right_table<br/>
+            ON left_table.{leftCol} = right_table.{rightCol}
+          </div>
+        )}
+      </div>
       <SaveBar onSave={() => onSave({ joinType, leftCol, rightCol, rightNodeId })} onClose={onClose} disabled={!leftCol || !rightCol} />
     </div>
   );
 }
 
-// ── 14. PySpark ───────────────────────────────────────────────────────────────
 function PySparkConfig({ config, onSave, onClose }) {
   const [code,     setCode]     = useState(config?.code     || `# Input dataframe is available as 'df'
 # Perform your transformations below
@@ -660,23 +644,25 @@ df = df.withColumn('full_name', concat(col('first_name'), lit(' '), col('last_na
   const [nodeName, setNodeName] = useState(config?.nodeName || "PySpark Node");
 
   return (
-    <div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 14, lineHeight: 1.6 }}>
         Write custom PySpark code to transform your data. The input dataframe is available as <code style={{ background: C.g100, padding: "1px 4px", borderRadius: 3, fontSize: 11 }}>df</code>.
       </p>
-      <div style={{ marginBottom: 12 }}>
-        <Label>Node Label</Label>
-        <Input value={nodeName} onChange={setNodeName} placeholder="e.g. Clean Names" />
-      </div>
-      <div>
-        <Label required>Python / PySpark Code</Label>
-        <div style={{ background: "#0f172a", borderRadius: 8, padding: 4, border: `1px solid ${C.g700}` }}>
-          <div style={{ padding: "4px 10px", background: "#1e293b", borderRadius: "6px 6px 0 0", display: "flex", gap: 5 }}>
-            {["#f87171","#fbbf24","#34d399"].map((c, i) => <span key={i} style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />)}
-            <span style={{ marginLeft: 8, fontSize: 10, color: C.g400 }}>python</span>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 12 }}>
+        <div>
+          <Label>Node Label</Label>
+          <Input value={nodeName} onChange={setNodeName} placeholder="e.g. Clean Names" />
+        </div>
+        <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+          <Label required>Python / PySpark Code</Label>
+          <div style={{ background: "#0f172a", borderRadius: 8, padding: 4, border: `1px solid ${C.g700}`, flex: 1, display: "flex", flexDirection: "column" }}>
+            <div style={{ padding: "4px 10px", background: "#1e293b", borderRadius: "6px 6px 0 0", display: "flex", gap: 5 }}>
+              {["#f87171","#fbbf24","#34d399"].map((c, i) => <span key={i} style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />)}
+              <span style={{ marginLeft: 8, fontSize: 10, color: C.g400 }}>python</span>
+            </div>
+            <textarea value={code} onChange={e => setCode(e.target.value)} spellCheck={false}
+              style={{ flex: 1, minHeight: 200, width: "100%", padding: "12px 14px", background: "transparent", border: "none", outline: "none", color: "#93c5fd", fontSize: 12, fontFamily: "monospace", resize: "none", lineHeight: 1.7, boxSizing: "border-box" }} />
           </div>
-          <textarea value={code} onChange={e => setCode(e.target.value)} rows={14} spellCheck={false}
-            style={{ width: "100%", padding: "12px 14px", background: "transparent", border: "none", outline: "none", color: "#93c5fd", fontSize: 12, fontFamily: "monospace", resize: "vertical", lineHeight: 1.7, boxSizing: "border-box" }} />
         </div>
       </div>
       <SaveBar onSave={() => onSave({ code, nodeName })} onClose={onClose} disabled={!code.trim()} />
@@ -702,8 +688,8 @@ const CONFIG_TITLE = {
 };
 
 const CONFIG_WIDTH = {
-  val_mapper: 640, group_agg: 580, join_data: 540, pyspark: 600,
-  filter_rows: 520, rename_col: 480, change_type: 480,
+  val_mapper: 580, group_agg: 540, join_data: 500, pyspark: 580,
+  filter_rows: 500, rename_col: 480, change_type: 480,
 };
 
 // ── MAIN EXPORT ───────────────────────────────────────────────────────────────
@@ -711,7 +697,7 @@ export function UtilityConfigModal({ node, columns, onSave, onClose, allNodes })
   if (!node) return null;
   const type    = node.data?.type;
   const config  = node.data?.config || {};
-  const width   = CONFIG_WIDTH[type] || 460;
+  const width   = CONFIG_WIDTH[type] || 440; // Disesuaikan sedikit untuk sidebar
   const title   = CONFIG_TITLE[type] || "Configure Node";
 
   const handleSave = (cfg) => {
@@ -722,34 +708,51 @@ export function UtilityConfigModal({ node, columns, onSave, onClose, allNodes })
   const props = { columns: columns || [], config, onSave: handleSave, onClose, allNodes };
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(11,30,61,.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 2000 }} onClick={onClose}>
-      <div style={{ background: C.white, borderRadius: 16, width, maxWidth: "95vw", maxHeight: "90vh", boxShadow: "0 24px 64px rgba(0,0,0,.22)", display: "flex", flexDirection: "column", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
-        {/* Header */}
-        <div style={{ background: `linear-gradient(90deg,${C.navy},${C.navyLight})`, padding: "15px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
-          <div>
-            <div style={{ color: C.white, fontWeight: 800, fontSize: 14 }}>{title}</div>
-            <div style={{ color: "#93c5fd", fontSize: 10, marginTop: 1 }}>Configure node transformation</div>
+    <>
+      {/* Animasi Sidebar ditambahkan via inline style */}
+      <style>{`
+        @keyframes fadeInOverlay { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideInRight { from { transform: translateX(100%); } to { transform: translateX(0); } }
+      `}</style>
+      
+      {/* Overlay Backdrop */}
+      <div 
+        style={{ position: "fixed", inset: 0, background: "rgba(11,30,61,.4)", display: "flex", justifyContent: "flex-end", zIndex: 2000, animation: "fadeInOverlay 0.2s ease-out" }} 
+        onClick={onClose}
+      >
+        {/* Panel Sidebar */}
+        <div 
+          style={{ background: C.white, width, maxWidth: "90vw", height: "100vh", boxShadow: "-8px 0 32px rgba(0,0,0,.15)", display: "flex", flexDirection: "column", overflow: "hidden", animation: "slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1)" }} 
+          onClick={e => e.stopPropagation()}
+        >
+          {/* Header Sidebar */}
+          <div style={{ background: `linear-gradient(90deg,${C.navy},#15325c)`, padding: "20px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+            <div>
+              <div style={{ color: C.white, fontWeight: 800, fontSize: 16 }}>{title}</div>
+              <div style={{ color: "#93c5fd", fontSize: 11, marginTop: 2 }}>Configure node transformation</div>
+            </div>
+            <button onClick={onClose} style={{ background: "rgba(255,255,255,.1)", border: "none", borderRadius: 6, width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: C.white, fontSize: 18, transition: "background 0.2s" }} onMouseEnter={e => e.target.style.background = "rgba(255,255,255,.2)"} onMouseLeave={e => e.target.style.background = "rgba(255,255,255,.1)"}>×</button>
           </div>
-          <button onClick={onClose} style={{ background: "rgba(255,255,255,.1)", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", color: C.white, fontSize: 16 }}>×</button>
-        </div>
-        {/* Scrollable body */}
-        <div style={{ padding: 22, overflowY: "auto", flex: 1 }}>
-          {type === "add_const"   && <AddConstantConfig    {...props} />}
-          {type === "select_col"  && <SelectColumnConfig   {...props} />}
-          {type === "rename_col"  && <RenameColumnsConfig  {...props} />}
-          {type === "drop_col"    && <DropColumnsConfig    {...props} />}
-          {type === "order_table" && <OrderTableConfig     {...props} />}
-          {type === "change_type" && <ChangeDataTypeConfig {...props} />}
-          {type === "set_val"     && <SetColumnValueConfig {...props} />}
-          {type === "val_mapper"  && <ValueMapperConfig    {...props} />}
-          {type === "fill_null"   && <FillNullConfig       {...props} />}
-          {type === "filter_rows" && <FilterRowsConfig     {...props} />}
-          {type === "group_agg"   && <GroupByAggConfig     {...props} />}
-          {type === "join_data"   && <JoinDataConfig       {...props} allNodes={allNodes} />}
-          {type === "pyspark"     && <PySparkConfig        {...props} />}
-          {!CONFIG_TITLE[type]    && <div style={{ color: C.g400, padding: 20, textAlign: "center" }}>No configuration available for this node type.</div>}
+          
+          {/* Scrollable body Sidebar */}
+          <div style={{ padding: "24px 24px 20px", overflowY: "auto", flex: 1, display: "flex", flexDirection: "column" }}>
+            {type === "add_const"   && <AddConstantConfig    {...props} />}
+            {type === "select_col"  && <SelectColumnConfig   {...props} />}
+            {type === "rename_col"  && <RenameColumnsConfig  {...props} />}
+            {type === "drop_col"    && <DropColumnsConfig    {...props} />}
+            {type === "order_table" && <OrderTableConfig     {...props} />}
+            {type === "change_type" && <ChangeDataTypeConfig {...props} />}
+            {type === "set_val"     && <SetColumnValueConfig {...props} />}
+            {type === "val_mapper"  && <ValueMapperConfig    {...props} />}
+            {type === "fill_null"   && <FillNullConfig       {...props} />}
+            {type === "filter_rows" && <FilterRowsConfig     {...props} />}
+            {type === "group_agg"   && <GroupByAggConfig     {...props} />}
+            {type === "join_data"   && <JoinDataConfig       {...props} allNodes={allNodes} />}
+            {type === "pyspark"     && <PySparkConfig        {...props} />}
+            {!CONFIG_TITLE[type]    && <div style={{ color: C.g400, padding: 20, textAlign: "center" }}>No configuration available for this node type.</div>}
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }

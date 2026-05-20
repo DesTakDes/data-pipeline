@@ -1,7 +1,9 @@
 // frontend/src/api.js
 import axios from 'axios';
 
-const api = axios.create({ baseURL: '/api' });
+// PERBAIKAN 1: Arahkan langsung ke URL backend FastAPI kamu.
+// Asumsi backend Python kamu jalan di port 8000. (Ubah jika port-nya beda)
+const api = axios.create({ baseURL: 'http://localhost:8000/api' });
 
 // ── Datasets ──────────────────────────────────────────────────────
 export const getDatasets     = ()         => api.get('/datasets');
@@ -26,5 +28,11 @@ export const getTaskInstances = (dagId, runId)  => api.get(`/airflow/dags/${dagI
 // ── Warehouse ─────────────────────────────────────────────────────
 export const getWarehouseTables = () => api.get('/warehouse/tables');
 
-// ── Pipeline ──────────────────────────────────────────────────────
-export const runPipeline = (nodes, edges) => api.post('/pipeline/run', { nodes, edges });
+// ── Pipeline (PERBAIKAN UTAMA DI SINI) ────────────────────────────
+
+// 1. Sesuaikan nama fungsinya dengan yang dipanggil di App.jsx
+// 2. Sesuaikan endpointnya pakai "pipelines" (ada 's' nya)
+export const runNewPipeline = (payload) => api.post('/pipelines/run', payload);
+
+// 3. Tambahkan fungsi untuk Polling Status DAG yang sebelumnya hilang
+export const getDagStatus = (runId) => api.get(`/pipelines/runs/${runId}/dag-status`);
