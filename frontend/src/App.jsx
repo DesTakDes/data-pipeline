@@ -161,12 +161,15 @@ function ETLNode({ id, data }) {
         {isOutput && (
           data.config?.outputName ? (
             <div>
-              <div style={{ background: C.greenTint, borderRadius: 6, padding: "5px 8px", marginBottom: 6 }}>
+              <div style={{ background: C.greenTint, borderRadius: 6, padding: "5px 8px", marginBottom: 4 }}>
                 <div style={{ fontSize: 10, fontWeight: 700, color: C.green }}>warehouse.{data.config.outputName}</div>
-                <div style={{ fontSize: 9, color: C.g400 }}>{upCols.length} cols from upstream</div>
-                {data.config.taskId && <div style={{ fontSize: 9, color: C.g500 }}>Task: {data.config.taskId}</div>}
+                <div style={{ fontSize: 9, color: C.g400 }}>{upCols.length} cols · Task: {data.config.taskId || "task_1"}</div>
               </div>
-              <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "3px 0", borderRadius: 5, border: `1px solid ${C.green}44`, background: "none", color: C.green, fontSize: 10, cursor: "pointer" }}>✎ Edit Output</button>
+              <div style={{ display: "flex", gap: 3, marginBottom: 4 }}>
+                <button onClick={() => data.onConfigure(id)} style={{ flex: 1, padding: "3px 0", borderRadius: 5, border: `1px solid ${C.green}44`, background: "none", color: C.green, fontSize: 9, fontWeight: 700, cursor: "pointer" }}>✎ Edit</button>
+                <button onClick={() => data.onSaveAs && data.onSaveAs(id, "csv")} style={{ flex: 1, padding: "3px 0", borderRadius: 5, border: `1px solid ${C.blue}44`, background: C.blueTint, color: C.blue, fontSize: 9, fontWeight: 700, cursor: "pointer" }}>⬇ CSV</button>
+                <button onClick={() => data.onSaveAs && data.onSaveAs(id, "parquet")} style={{ flex: 1, padding: "3px 0", borderRadius: 5, border: `1px solid ${C.spark}44`, background: C.sparkTint, color: C.spark, fontSize: 9, fontWeight: 700, cursor: "pointer" }}>⬇ PKT</button>
+              </div>
             </div>
           ) : (
             <button onClick={() => data.onConfigure(id)} style={{ width: "100%", padding: "6px 0", borderRadius: 6, border: `1px dashed ${C.green}`, background: C.greenTint, color: C.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>+ Configure Output</button>
@@ -381,39 +384,48 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const [configModal, setConfigModal] = useState(null);
   const [utilNode, setUtilNode] = useState(null);
   const [previewNode, setPreviewNode] = useState(null);
+  const [outputSidebarNodeId, setOutputSidebarNodeId] = useState(null);
   const [inputConfig, setInputConfig] = useState({ datasetId: "" });
-  const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "task_1" });
+  const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "" });
   const pollRef = useRef(null);
 
   // Column propagation
   const columnMap = useMemo(() => computeNodeColumns(nodes, edges), [nodes, edges]);
 
   useEffect(() => {
-    setNodes(ns => {
-      let hasChanges = false; // <-- Penanda apakah ada perubahan
+  setNodes(ns => {
+    let changed = false;
+    const nextNodes = ns.map(n => {
+      const sourceEdge = edges.find(e => e.target === n.id);
+      const upstreamCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
+      const outputCols   = columnMap[n.id] || [];
+      const isConnected  = edges.some(e => e.target === n.id);
       
-      const newNodes = ns.map(n => {
-        const sourceEdge = edges.find(e => e.target === n.id);
-        const upstreamCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
-        const outputCols   = columnMap[n.id] || [];
-        const isConnected  = edges.some(e => e.target === n.id);
-        
-        if (
-          JSON.stringify(n.data.upstreamColumns) !== JSON.stringify(upstreamCols) ||
-          JSON.stringify(n.data.outputColumns) !== JSON.stringify(outputCols) ||
-          n.data.isConnected !== isConnected
-        ) {
-          hasChanges = true; // <-- Tandai bahwa ada perubahan
-          return { ...n, data: { ...n.data, upstreamColumns: upstreamCols, outputColumns: outputCols, isConnected } };
-        }
-        return n;
-      });
+      const isUpstreamChanged = JSON.stringify(n.data.upstreamColumns) !== JSON.stringify(upstreamCols);
+      const isOutputChanged = JSON.stringify(n.data.outputColumns) !== JSON.stringify(outputCols);
+      const isConnectionChanged = n.data.isConnected !== isConnected;
 
-      // PENTING: Jika tidak ada yang berubah, kembalikan array 'ns' lama untuk MENCEGAH INFINITE LOOP
-      return hasChanges ? newNodes : ns; 
+      if (isUpstreamChanged || isOutputChanged || isConnectionChanged) {
+        changed = true;
+        return { 
+          ...n, 
+          data: { 
+            ...n.data, 
+            upstreamColumns: upstreamCols, 
+            outputColumns: outputCols, 
+            isConnected 
+          } 
+        };
+      }
+      return n;
     });
-  }, [columnMap, edges, setNodes]);
-  
+
+    // JIKA ada perubahan nyata, kembalikan array baru.
+    // JIKA TIDAK, kembalikan referensi array lama (ns) untuk menghentikan loop.
+    return changed ? nextNodes : ns;
+  });
+}, [columnMap, edges, setNodes]);
+
   const buildCallbacks = useCallback(() => ({
     onDelete:    (nid) => setNodes(ns => ns.filter(n => n.id !== nid)),
     onDuplicate: (nid) => setNodes(ns => {
@@ -424,10 +436,18 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
       const n = ns.find(x => x.id === nid); if (!n) return ns;
       const isIO = ["input_dataset","output_dataset"].includes(n.data.type);
       if (isIO) {
-        if (n.data.type === "output_dataset" && n.data.config?.outputName) {
-          setOutputConfig({ outputName: n.data.config.outputName, description: n.data.config.description || "", taskId: n.data.config.taskId || "task_1" });
+        if (n.data.type === "output_dataset") {
+          // Pre-fill existing config for re-edit
+          setOutputConfig({
+            outputName: n.data.config?.outputName || "",
+            description: n.data.config?.description || "",
+            taskId: n.data.config?.taskId || `task_${Date.now().toString().slice(-4)}`,
+          });
+          setOutputSidebarNodeId(nid);
+        } else {
+          setInputConfig({ datasetId: "" });
+          setConfigModal({ nodeId: nid, type: n.data.type });
         }
-        setConfigModal({ nodeId: nid, type: n.data.type });
       } else {
         setUtilNode(n);
       }
@@ -438,7 +458,25 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
       if (n) setPreviewNode(n);
       return ns;
     }),
-  }), [setNodes]);
+    onSaveAs: async (nid, format) => {
+      // Find the run_id for this output node by output name
+      setNodes(ns => {
+        const n = ns.find(x => x.id === nid);
+        if (!n?.data?.config?.outputName) {
+          toast("Configure output first, then run pipeline before saving", "error");
+          return ns;
+        }
+        const outName = n.data.config.outputName;
+        // Trigger download directly from warehouse
+        const url = `/api/warehouse/${outName}/download?format=${format}`;
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${outName}.${format === "parquet" ? "parquet" : "csv"}`;
+        a.click();
+        return ns;
+      });
+    },
+  }), [setNodes, toast]);
 
   // Rebuild callbacks on load
   useEffect(() => {
@@ -480,11 +518,13 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
 
   const applyOutputConfig = () => {
     if (!outputConfig.outputName.trim()) return toast("Output name required", "error");
+    const nodeId = outputSidebarNodeId;
+    if (!nodeId) return;
     const cbs = buildCallbacks();
-    setNodes(ns => ns.map(n => n.id === configModal.nodeId ? {
+    setNodes(ns => ns.map(n => n.id === nodeId ? {
       ...n, data: { ...n.data, config: { ...outputConfig }, ...cbs }
     } : n));
-    setConfigModal(null);
+    setOutputSidebarNodeId(null);
     toast("Output configured", "success");
   };
 
@@ -532,24 +572,18 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     if (disconnected) return toast(`Node "${disconnected.data.label}" is not connected`, "error");
 
     const input = inputNodes[0].data.config.dataset;
-      const tasks = buildTasks();
-      const inputTable = input.table_name ? `staging.${input.table_name}` : `staging.${input.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g,'_')}`;
+    const tasks = buildTasks();
+    const inputTable = input.table_name ? `staging.${input.table_name}` : `staging.${input.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g,'_')}`;
 
-      // --- TAMBAHAN KODE: Ambil nama output untuk dijadikan nama DAG ---
-      const mainOutput = tasks[0].output_name; 
-      const safeOutputName = mainOutput.replace(/[^a-zA-Z0-9_]/g, '_'); // Pastikan aman untuk Airflow
-      const customDagId = `dag_${safeOutputName}`;
-
-      setRunning(true);
-      try {
-        const r = await API.runPipeline({
-          workflow_id:   customDagId,           // <-- Sekarang ID-nya memakai nama output
-          workflow_name: `Pipeline ${mainOutput}`, // <-- Nama workflow juga menyesuaikan
-          input_table:   inputTable,
-          tasks,
-          description:   workflow.description || "",
-        });
-      
+    setRunning(true);
+    try {
+      const r = await API.runPipeline({
+        workflow_id:   workflow.id,
+        workflow_name: workflow.name,
+        input_table:   inputTable,
+        tasks,
+        description:   workflow.description || "",
+      });
       const { run_id, dag_id } = r.data;
       toast(`Spark Pipeline triggered! DAG: ${dag_id}`, "success");
       setDagStatus({ dag_id, state: "queued", run_id });
@@ -582,26 +616,13 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const STATUS_BORDER = { success: C.green, running: C.blue, failed: C.red, queued: C.gold, none: C.g300 };
 
   useEffect(() => {
-      if (!Object.keys(taskStates).length) return;
-      
-      setNodes(ns => {
-        let hasChanges = false;
-        
-        const newNodes = ns.map(n => {
-          const state = taskStates[n.id] || "none";
-          if (!STATUS_BG[state]) return n;
-          
-          const newBorder = STATUS_BORDER[state];
-          // Jangan update jika border color sudah sama
-          if (n.style?.borderColor === newBorder) return n; 
-          
-          hasChanges = true;
-          return { ...n, style: { ...n.style, borderColor: newBorder } };
-        });
-        
-        return hasChanges ? newNodes : ns;
-      });
-    }, [taskStates, setNodes]);
+    if (!Object.keys(taskStates).length) return;
+    setNodes(ns => ns.map(n => {
+      const state = taskStates[n.id] || "none";
+      if (!STATUS_BG[state]) return n;
+      return { ...n, style: { ...n.style, borderColor: STATUS_BORDER[state] } };
+    }));
+  }, [taskStates]);
 
   const utilNodeUpstreamCols = useMemo(() => {
     if (!utilNode) return [];
@@ -701,14 +722,164 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
             <Panel position="top-right">
               <div style={{ background: C.white, border: `1px solid ${C.g200}`, borderRadius: 8, padding: "4px 10px", fontSize: 11, color: C.g500, display: "flex", alignItems: "center", gap: 8 }}>
                 <Ic.Spark />
-                <span style={{ color: C.spark, fontWeight: 700 }}>Spark DAG</span>
+                <span style={{ color: C.spark, fontWeight: 700 }}>DAG: {workflow.name}</span>
                 <span style={{ color: C.g400 }}>{nodes.length}N · {edges.length}E · {outputNodeCount}Out</span>
               </div>
             </Panel>
           </ReactFlow>
 
+          {/* Output Config Sidebar (right) */}
+          {outputSidebarNodeId && (() => {
+            const outNode = nodes.find(n => n.id === outputSidebarNodeId);
+            const sourceEdge = edges.find(e => e.target === outputSidebarNodeId);
+            const upCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
+            const isConfigured = outNode?.data?.config?.outputName;
+            return (
+              <div style={{
+                position: "absolute", right: 0, top: 0, bottom: 0, width: 320,
+                background: C.white, borderLeft: `2px solid ${C.green}`,
+                display: "flex", flexDirection: "column", zIndex: 50,
+                boxShadow: "-6px 0 32px rgba(0,0,0,0.12)",
+                fontFamily: "'DM Sans',sans-serif",
+              }}>
+                {/* Header */}
+                <div style={{ background: `linear-gradient(135deg,${C.green},${C.navyLight})`, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+                  <div>
+                    <div style={{ color: C.white, fontWeight: 800, fontSize: 14 }}>📤 Configure Output</div>
+                    <div style={{ color: "rgba(255,255,255,0.65)", fontSize: 10, marginTop: 1 }}>
+                      1 Output Node = 1 DAG Task
+                    </div>
+                  </div>
+                  <button onClick={() => setOutputSidebarNodeId(null)} style={{ background: "rgba(255,255,255,0.15)", border: "none", borderRadius: 6, padding: "5px 9px", cursor: "pointer", color: C.white, fontSize: 16, fontWeight: 700 }}>×</button>
+                </div>
+
+                {/* DAG info banner */}
+                <div style={{ background: C.sparkTint, borderBottom: `1px solid ${C.spark}22`, padding: "8px 16px" }}>
+                  <div style={{ fontSize: 10, color: C.spark, fontWeight: 700 }}>⚡ DAG Name</div>
+                  <div style={{ fontSize: 12, fontFamily: "monospace", color: C.navy, fontWeight: 700, marginTop: 2 }}>{
+                    workflow.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/_+/g,"_").replace(/^_|_$/g,"")
+                  }</div>
+                  <div style={{ fontSize: 9, color: C.g400, marginTop: 1 }}>Each output node = one task in this DAG</div>
+                </div>
+
+                {/* Form body */}
+                <div style={{ flex: 1, overflow: "auto", padding: "16px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+                    {/* Task ID */}
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: C.g600, marginBottom: 5 }}>
+                        Task ID <span style={{ fontSize: 9, color: C.g400, fontWeight: 400 }}>(unique identifier for this task)</span>
+                      </div>
+                      <input
+                        value={outputConfig.taskId}
+                        onChange={e => setOutputConfig(o => ({ ...o, taskId: e.target.value.toLowerCase().replace(/[^a-z0-9_]/g,"_") }))}
+                        placeholder="e.g. clean_sales_data"
+                        style={{ width: "100%", padding: "9px 11px", borderRadius: 8, border: `1.5px solid ${outputConfig.taskId ? C.blue : C.g200}`, fontSize: 12, boxSizing: "border-box", outline: "none", color: C.navy, fontFamily: "monospace" }}
+                      />
+                    </div>
+
+                    {/* Output Table Name */}
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: C.g600, marginBottom: 5 }}>
+                        Output Table Name <span style={{ color: C.red }}>*</span>
+                      </div>
+                      <input
+                        value={outputConfig.outputName}
+                        onChange={e => setOutputConfig(o => ({ ...o, outputName: e.target.value.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"") }))}
+                        placeholder="e.g. sales_clean_2026"
+                        style={{ width: "100%", padding: "9px 11px", borderRadius: 8, border: `1.5px solid ${outputConfig.outputName ? C.green : C.g200}`, fontSize: 12, boxSizing: "border-box", outline: "none", color: C.navy, fontFamily: "monospace" }}
+                      />
+                      <div style={{ fontSize: 10, color: C.g400, marginTop: 3 }}>
+                        → <span style={{ fontFamily: "monospace", color: C.green, fontWeight: 700 }}>warehouse.{outputConfig.outputName || "your_table"}</span>
+                      </div>
+                    </div>
+
+                    {/* Description */}
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: C.g600, marginBottom: 5 }}>Description</div>
+                      <textarea
+                        value={outputConfig.description}
+                        onChange={e => setOutputConfig(o => ({ ...o, description: e.target.value }))}
+                        placeholder="Describe what this output contains..."
+                        rows={3}
+                        style={{ width: "100%", padding: "9px 11px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 12, boxSizing: "border-box", outline: "none", color: C.g700, resize: "none" }}
+                      />
+                    </div>
+
+                    {/* Upstream columns preview */}
+                    {upCols.length > 0 && (
+                      <div style={{ background: C.greenTint, borderRadius: 8, padding: 10 }}>
+                        <div style={{ fontSize: 10, fontWeight: 700, color: C.green, marginBottom: 6 }}>
+                          {upCols.length} columns will be saved to warehouse:
+                        </div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, maxHeight: 80, overflowY: "auto" }}>
+                          {upCols.map(c => (
+                            <span key={c} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3, background: C.green+"22", color: C.green, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {!sourceEdge && (
+                      <div style={{ background: C.goldTint, borderRadius: 8, padding: 10, fontSize: 11, color: C.gold }}>
+                        ⚠ Connect this node to an upstream node first
+                      </div>
+                    )}
+
+                    {/* Save As section — shown if already configured */}
+                    {isConfigured && (
+                      <div style={{ borderTop: `1px solid ${C.g200}`, paddingTop: 14 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: C.g600, marginBottom: 8 }}>
+                          ⬇ Save As (after pipeline runs)
+                        </div>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <a
+                            href={`/api/warehouse/${outNode.data.config.outputName}/download?format=csv`}
+                            download
+                            style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1.5px solid ${C.blue}`, background: C.blueTint, color: C.blue, fontWeight: 700, fontSize: 12, textDecoration: "none", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}
+                          >
+                            <Ic.Download /> CSV
+                          </a>
+                          <a
+                            href={`/api/warehouse/${outNode.data.config.outputName}/download?format=parquet`}
+                            download
+                            style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1.5px solid ${C.spark}`, background: C.sparkTint, color: C.spark, fontWeight: 700, fontSize: 12, textDecoration: "none", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}
+                          >
+                            <Ic.Spark /> Parquet
+                          </a>
+                        </div>
+                        <div style={{ fontSize: 9, color: C.g400, marginTop: 5, textAlign: "center" }}>
+                          File will download from warehouse after pipeline completes
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Footer buttons */}
+                <div style={{ padding: "14px 16px", borderTop: `1px solid ${C.g200}`, background: C.g50, flexShrink: 0 }}>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => setOutputSidebarNodeId(null)}
+                      style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={applyOutputConfig}
+                      disabled={!outputConfig.outputName}
+                      style={{ flex: 2, padding: "9px 0", borderRadius: 8, background: !outputConfig.outputName ? C.g300 : `linear-gradient(90deg,${C.green},#15803d)`, border: "none", color: C.white, fontSize: 12, fontWeight: 700, cursor: !outputConfig.outputName ? "not-allowed" : "pointer" }}
+                    >
+                      {isConfigured ? "✓ Update Config" : "Save Output Config"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Preview panel */}
-          {previewNode && (
+          {previewNode && !outputSidebarNodeId && (
             <NodePreviewPanel
               node={previewNode}
               datasets={datasets}
@@ -755,56 +926,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setConfigModal(null)} style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
             <button onClick={applyInputConfig} disabled={!inputConfig.datasetId} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !inputConfig.datasetId ? C.g300 : C.blue, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !inputConfig.datasetId ? "not-allowed" : "pointer" }}>Apply Dataset</button>
-          </div>
-        </Modal>
-      )}
-
-      {/* Output Dataset Config Modal */}
-      {configModal?.type === "output_dataset" && (
-        <Modal title="Configure Output Dataset" onClose={() => setConfigModal(null)}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Task ID <span style={{ fontSize: 10, color: C.g400 }}>(unique per output in this workflow)</span></div>
-              <input value={outputConfig.taskId}
-                onChange={e => setOutputConfig(o => ({ ...o, taskId: e.target.value.toLowerCase().replace(/[^a-z0-9_]/g,"_") }))}
-                placeholder="e.g. task_sales_clean"
-                style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, fontFamily: "monospace" }} />
-            </div>
-            <div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Output Table Name *</div>
-              <input value={outputConfig.outputName}
-                onChange={e => setOutputConfig(o => ({ ...o, outputName: e.target.value.toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,"") }))}
-                placeholder="e.g. sales_clean_2026"
-                style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1.5px solid ${outputConfig.outputName ? C.green : C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, fontFamily: "monospace" }} />
-              <div style={{ fontSize: 10, color: C.g400, marginTop: 3 }}>Saved as warehouse.{outputConfig.outputName || "your_table"}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: 12, fontWeight: 700, color: C.g600, marginBottom: 6 }}>Description</div>
-              <textarea value={outputConfig.description} onChange={e => setOutputConfig(o => ({ ...o, description: e.target.value }))}
-                placeholder="Describe this output..." rows={2}
-                style={{ width: "100%", padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 13, boxSizing: "border-box", outline: "none", color: C.g700, resize: "none", fontFamily: "'DM Sans',sans-serif" }} />
-            </div>
-            {/* Upstream columns */}
-            {(() => {
-              const sourceEdge = edges.find(e => e.target === configModal.nodeId);
-              const upCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
-              return upCols.length > 0 ? (
-                <div style={{ background: C.greenTint, borderRadius: 8, padding: 10 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.green, marginBottom: 6 }}>{upCols.length} columns will be saved:</div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                    {upCols.map(c => <span key={c} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: C.green+"22", color: C.green, fontWeight: 600, fontFamily: "monospace" }}>{c}</span>)}
-                  </div>
-                </div>
-              ) : null;
-            })()}
-            {/* Download format */}
-            <div style={{ background: C.sparkTint, borderRadius: 8, padding: 10, fontSize: 11, color: C.spark }}>
-              <Ic.Spark /> Output will be downloadable as CSV or Parquet after pipeline runs
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-            <button onClick={() => setConfigModal(null)} style={{ flex: 1, padding: "9px 0", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
-            <button onClick={applyOutputConfig} disabled={!outputConfig.outputName} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: !outputConfig.outputName ? C.g300 : C.green, border: "none", color: C.white, fontSize: 13, fontWeight: 700, cursor: !outputConfig.outputName ? "not-allowed" : "pointer" }}>Save Output Config</button>
           </div>
         </Modal>
       )}

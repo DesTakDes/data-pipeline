@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 AIRFLOW_URL  = os.getenv("AIRFLOW_URL", "http://airflow-webserver:8080")
-AIRFLOW_AUTH = ("admin", "admin")
+AIRFLOW_AUTH = ("admin", "admin123")
 PG_CONFIG    = {
     "host":     os.getenv("POSTGRES_HOST", "postgres"),
     "port":     int(os.getenv("POSTGRES_PORT", 5432)),
@@ -364,11 +364,13 @@ def run_pipeline(payload: dict):
         }]
 
     safe_input  = re.sub(r'[^a-zA-Z0-9_.]', '', input_table)
-    safe_wf     = re.sub(r'[^a-z0-9_]', '_', workflow_id.lower())[:40]
-    dag_id      = f"pipeline_{safe_wf}"
+    # DAG ID = nama workflow langsung (lowercase, tanpa prefix)
+    safe_wf_name = re.sub(r'[^a-z0-9_]', '_', workflow_name.lower().strip())
+    safe_wf_name = re.sub(r'_+', '_', safe_wf_name).strip('_')[:60]
+    dag_id       = safe_wf_name if safe_wf_name else re.sub(r'[^a-z0-9_]', '_', workflow_id.lower())[:60]
 
     airflow_url  = os.getenv("AIRFLOW_URL", "http://airflow-webserver:8080")
-    airflow_auth = ("admin", "admin")
+    airflow_auth = ("admin", "admin123")
 
     # Check if DAG exists
     dag_exists = False
@@ -834,8 +836,8 @@ def run_task(task_def, **context):
     transforms  = task_def.get("transforms", [])
 
     safe_output = output_name.lower().replace(" ", "_")
-    import re as re
-    safe_output = re.sub(r\'[^a-z0-9_]\', \'_\', safe_output)
+    import re as _re
+    safe_output = _re.sub(r\'[^a-z0-9_]\', \'_\', safe_output)
 
     # Detect input size
     tbl = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{INPUT_TABLE}"
@@ -884,7 +886,8 @@ def run_task(task_def, **context):
 
 def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cfg, task_id):
     from pyspark.sql import SparkSession
-    import pyspark.sql.functions as F
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType, LongType, DoubleType, BooleanType, DateType, TimestampType
 
     # Build SparkSession with right-sized resources
     builder = SparkSession.builder \\
@@ -913,7 +916,7 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     num_partitions = max(1, min(8, row_count // 100000))
 
     df = spark.read.jdbc(
-        url=jdbc_url, table=f"({\'SELECT * FROM \' + input_table}) AS t",
+        url=jdbc_url, table=f"(SELECT * FROM {input_table}) AS t",
         numPartitions=num_partitions, properties=jdbc_props
     )
 
@@ -930,12 +933,12 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     if len(transforms) > 3:
         df.cache()
 
-    # Write to warehouse via JDBC (columnar-optimized)
+    # Write to warehouse via JDBC
     df.write.jdbc(
         url=jdbc_url,
         table=f"warehouse.{output_name}",
         mode="overwrite",
-        properties={**jdbc_props, "createTableOptions": "WITH (fillfactor=90)"}
+        properties=jdbc_props
     )
 
     # Also save as Parquet for large datasets
@@ -949,7 +952,7 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
 
 
 def apply_spark_transforms(spark, df, transforms):
-    import pyspark.sql.functions as F
+    from pyspark.sql import functions as F
 
     for tx in transforms:
         ntype  = tx.get("type", "")

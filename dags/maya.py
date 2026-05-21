@@ -1,6 +1,6 @@
-# Auto-generated Spark DAG: pipeline_dag_dayakaya
-# Workflow: Pipeline dayakaya
-# Generated: 2026-05-19T08:12:19.329960
+# Auto-generated Spark DAG: maya
+# Workflow: maya
+# Generated: 2026-05-21T03:16:49.853873
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -8,10 +8,10 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
 import json, requests, os, math
 
-DAG_ID      = 'pipeline_dag_dayakaya'
-INPUT_TABLE = 'staging.mcdonald_s_reviews'
-WORKFLOW_ID = 'dag_dayakaya'
-TASKS_DEF   = json.loads('[{"task_id": "task_2", "output_name": "dayakaya", "transforms": [{"type": "select_col", "config": {}}], "depends_on": []}]')
+DAG_ID      = 'maya'
+INPUT_TABLE = 'staging.subway'
+WORKFLOW_ID = 'wf_1779332822879'
+TASKS_DEF   = json.loads('[{"task_id": "task_1926", "output_name": "sa", "transforms": [{"type": "select_col", "config": {"columns": ["index", "zip_code", "name", "url", "street_address"]}}], "depends_on": []}]')
 BACKEND_URL = "http://backend:8000"
 
 default_args = {"owner": "etlflow", "retries": 0}
@@ -63,8 +63,8 @@ def run_task(task_def, **context):
     transforms  = task_def.get("transforms", [])
 
     safe_output = output_name.lower().replace(" ", "_")
-    import re as re
-    safe_output = re.sub(r'[^a-z0-9_]', '_', safe_output)
+    import re as _re
+    safe_output = _re.sub(r'[^a-z0-9_]', '_', safe_output)
 
     # Detect input size
     tbl = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{INPUT_TABLE}"
@@ -114,7 +114,7 @@ def run_task(task_def, **context):
 def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cfg, task_id):
     from pyspark.sql import SparkSession
     from pyspark.sql import functions as F
-    from pyspark.sql.types import *
+    from pyspark.sql.types import StringType, LongType, DoubleType, BooleanType, DateType, TimestampType
 
     # Build SparkSession with right-sized resources
     builder = SparkSession.builder \
@@ -143,7 +143,7 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     num_partitions = max(1, min(8, row_count // 100000))
 
     df = spark.read.jdbc(
-        url=jdbc_url, table=f"({'SELECT * FROM ' + input_table}) AS t",
+        url=jdbc_url, table=f"(SELECT * FROM {input_table}) AS t",
         numPartitions=num_partitions, properties=jdbc_props
     )
 
@@ -160,12 +160,12 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     if len(transforms) > 3:
         df.cache()
 
-    # Write to warehouse via JDBC (columnar-optimized)
+    # Write to warehouse via JDBC
     df.write.jdbc(
         url=jdbc_url,
         table=f"warehouse.{output_name}",
         mode="overwrite",
-        properties={**jdbc_props, "createTableOptions": "WITH (fillfactor=90)"}
+        properties=jdbc_props
     )
 
     # Also save as Parquet for large datasets
@@ -373,12 +373,12 @@ def run_with_postgres(pg, input_table, output_name, transforms, task_id, row_cou
 
 
 with DAG(
-    dag_id='pipeline_dag_dayakaya',
+    dag_id='maya',
     default_args=default_args,
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["etl", "spark", "generated", 'dag_dayakaya'],
+    tags=["etl", "spark", "generated", 'wf_1779332822879'],
     description='',
 ) as dag:
     airflow_tasks = {}

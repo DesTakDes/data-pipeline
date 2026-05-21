@@ -1,6 +1,6 @@
-# Auto-generated Spark DAG: pipeline_dag_dayacasss
-# Workflow: Pipeline dayacasss
-# Generated: 2026-05-19T08:25:58.917727
+# Auto-generated Spark DAG: lada
+# Workflow: lada
+# Generated: 2026-05-21T03:43:54.161138
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -8,10 +8,10 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
 import json, requests, os, math
 
-DAG_ID      = 'pipeline_dag_dayacasss'
-INPUT_TABLE = 'staging.mcdonald_s_reviews'
-WORKFLOW_ID = 'dag_dayacasss'
-TASKS_DEF   = json.loads('[{"task_id": "task_2", "output_name": "dayacasss", "transforms": [{"type": "select_col", "config": {}}], "depends_on": []}]')
+DAG_ID      = 'lada'
+INPUT_TABLE = 'staging.subway'
+WORKFLOW_ID = 'wf_1779334900081'
+TASKS_DEF   = json.loads('[{"task_id": "task_3068", "output_name": "gai", "transforms": [{"type": "join_data", "config": {"joinType": "LEFT JOIN", "leftCol": "name", "rightCol": "spending_score_(1_100)", "rightNodeId": "n101"}}, {"type": "fill_null", "config": {"columns": ["index", "name", "url", "street_address", "city", "state", "zip_code", "country", "phone_number_1", "phone_number_2", "fax_1", "fax_2", "email_1", "email_2", "website", "open_hours", "latitude", "longitude", "facebook", "twitter", "instagram", "pinterest", "youtube"], "fillValue": "", "fillType": "mean"}}], "depends_on": []}]')
 BACKEND_URL = "http://backend:8000"
 
 default_args = {"owner": "etlflow", "retries": 0}
@@ -63,8 +63,8 @@ def run_task(task_def, **context):
     transforms  = task_def.get("transforms", [])
 
     safe_output = output_name.lower().replace(" ", "_")
-    import re as re
-    safe_output = re.sub(r'[^a-z0-9_]', '_', safe_output)
+    import re as _re
+    safe_output = _re.sub(r'[^a-z0-9_]', '_', safe_output)
 
     # Detect input size
     tbl = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{INPUT_TABLE}"
@@ -113,7 +113,8 @@ def run_task(task_def, **context):
 
 def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cfg, task_id):
     from pyspark.sql import SparkSession
-    import pyspark.sql.functions as F
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType, LongType, DoubleType, BooleanType, DateType, TimestampType
 
     # Build SparkSession with right-sized resources
     builder = SparkSession.builder \
@@ -142,7 +143,7 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     num_partitions = max(1, min(8, row_count // 100000))
 
     df = spark.read.jdbc(
-        url=jdbc_url, table=f"({'SELECT * FROM ' + input_table}) AS t",
+        url=jdbc_url, table=f"(SELECT * FROM {input_table}) AS t",
         numPartitions=num_partitions, properties=jdbc_props
     )
 
@@ -159,12 +160,12 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     if len(transforms) > 3:
         df.cache()
 
-    # Write to warehouse via JDBC (columnar-optimized)
+    # Write to warehouse via JDBC
     df.write.jdbc(
         url=jdbc_url,
         table=f"warehouse.{output_name}",
         mode="overwrite",
-        properties={**jdbc_props, "createTableOptions": "WITH (fillfactor=90)"}
+        properties=jdbc_props
     )
 
     # Also save as Parquet for large datasets
@@ -178,7 +179,7 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
 
 
 def apply_spark_transforms(spark, df, transforms):
-    import pyspark.sql.functions as F
+    from pyspark.sql import functions as F
 
     for tx in transforms:
         ntype  = tx.get("type", "")
@@ -372,12 +373,12 @@ def run_with_postgres(pg, input_table, output_name, transforms, task_id, row_cou
 
 
 with DAG(
-    dag_id='pipeline_dag_dayacasss',
+    dag_id='lada',
     default_args=default_args,
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["etl", "spark", "generated", 'dag_dayacasss'],
+    tags=["etl", "spark", "generated", 'wf_1779334900081'],
     description='',
 ) as dag:
     airflow_tasks = {}
