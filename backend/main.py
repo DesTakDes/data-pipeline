@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import psycopg2
@@ -10,9 +10,13 @@ import io
 import json
 import re
 import time
+import uuid
+import tempfile
+import shutil
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
+import upload_worker
 
 app = FastAPI(title="ETLFlow API")
 
@@ -157,86 +161,67 @@ def delete_dataset(dataset_id: int):
 
 @app.post("/api/datasets/upload")
 async def upload_dataset(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     name: Optional[str] = Form(None),
 ):
-    content = await file.read()
-    filename = name or file.filename or "upload"
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "csv"
-    file_size_bytes = len(content)
-    file_size_gb = file_size_bytes / (1024 ** 3)
-    is_large = file_size_gb >= LARGE_FILE_THRESHOLD_GB
+    """
+    Chunked upload: save file to disk immediately, return job_id,
+    then process in background (parse → parquet if ≥5GB → insert DB).
+    """
+    filename   = name or file.filename or "upload"
+    job_id     = str(uuid.uuid4())
 
+    # Save to a temp file (streaming, no full memory load)
+    tmp_dir  = "/tmp/etlflow_uploads"
+    os.makedirs(tmp_dir, exist_ok=True)
+    ext      = filename.rsplit(".", 1)[-1].lower() if "." in filename else "csv"
+    tmp_path = f"{tmp_dir}/{job_id}.{ext}"
+
+    # Stream file to disk in 8 MB chunks
+    file_size_bytes = 0
     try:
-        if ext == "csv":
-            try:
-                df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
-            except UnicodeDecodeError:
-                df = pd.read_csv(io.BytesIO(content), encoding="latin-1")
-        elif ext in ("xlsx", "xls"):
-            df = pd.read_excel(io.BytesIO(content))
-        else:
-            raise HTTPException(400, "Only CSV and Excel supported")
-    except HTTPException:
-        raise
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = await file.read(8 * 1024 * 1024)  # 8 MB chunks
+                if not chunk:
+                    break
+                f.write(chunk)
+                file_size_bytes += len(chunk)
     except Exception as e:
-        raise HTTPException(400, f"Could not parse file: {e}")
+        raise HTTPException(500, f"Failed to save file: {e}")
 
-    # Sanitize column names
-    df.columns = [
-        c.strip().lower().replace(" ", "_").replace("-", "_").replace(".", "_")
-        for c in df.columns
-    ]
-    df = df.where(pd.notnull(df), None)
+    # Mark job as queued
+    upload_worker._set(job_id,
+        status="queued", pct=2,
+        message=f"File received ({file_size_bytes/1024/1024:.1f} MB), processing…",
+        filename=filename, file_size_bytes=file_size_bytes,
+    )
 
-    base_name  = filename.rsplit(".", 1)[0]
-    table_name = re.sub(r'[^a-z0-9_]', '_', base_name.lower())
-    table_name = re.sub(r'_+', '_', table_name).strip('_')
-
-    conn = get_conn()
-    cur = conn.cursor()
-    ensure_schemas(cur, conn)
-    ensure_datasets_table(cur, conn)
-
-    # Save as Parquet if large
-    parquet_path = None
-    if is_large:
-        os.makedirs(PARQUET_DIR, exist_ok=True)
-        parquet_path = f"{PARQUET_DIR}/{table_name}.parquet"
-        df.to_parquet(parquet_path, index=False, engine='pyarrow')
-
-    # Create staging table
-    type_map = {"int64": "BIGINT", "float64": "NUMERIC", "bool": "BOOLEAN"}
-    col_defs = ", ".join([
-        f'"{c}" {type_map.get(str(df[c].dtype), "TEXT")}'
-        for c in df.columns
-    ])
-    cur.execute(f'DROP TABLE IF EXISTS staging."{table_name}"')
-    cur.execute(f'CREATE TABLE staging."{table_name}" ({col_defs})')
-
-    cols = [f'"{c}"' for c in df.columns]
-    placeholders = ", ".join(["%s"] * len(df.columns))
-    insert_sql = f'INSERT INTO staging."{table_name}" ({", ".join(cols)}) VALUES ({placeholders})'
-    rows = [tuple(None if (v is None or (isinstance(v, float) and pd.isna(v))) else v for v in row) for row in df.itertuples(index=False)]
-    psycopg2.extras.execute_batch(cur, insert_sql, rows, page_size=500)
-
-    size_kb = file_size_bytes / 1024
-    size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else (f"{size_kb/1024:.1f} MB" if size_kb < 1024*1024 else f"{file_size_gb:.2f} GB")
-
-    cur.execute("""
-        INSERT INTO meta.datasets (name, type, status, row_count, col_count, file_size, file_size_bytes, table_name, parquet_path, is_large)
-        VALUES (%s, %s, 'deployed', %s, %s, %s, %s, %s, %s, %s) RETURNING id
-    """, (filename, ext.upper(), len(df), len(df.columns), size_str, file_size_bytes, table_name, parquet_path, is_large))
-    new_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close(); conn.close()
+    # Schedule background processing
+    background_tasks.add_task(
+        upload_worker.process_upload,
+        job_id, tmp_path, filename, file_size_bytes
+    )
 
     return {
-        "id": new_id, "name": filename, "type": ext.upper(),
-        "rows": len(df), "columns": list(df.columns),
-        "size": size_str, "table_name": table_name,
-        "is_large": is_large, "parquet_path": parquet_path,
+        "job_id":   job_id,
+        "status":   "processing",
+        "filename": filename,
+        "size_bytes": file_size_bytes,
+        "message":  "Upload received — processing in background",
     }
+
+
+@app.get("/api/datasets/upload/status/{job_id}")
+def upload_status(job_id: str):
+    """Poll endpoint for upload progress."""
+    job = upload_worker.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
 
 @app.post("/api/datasets/connect-db")
 def connect_db(payload: dict):

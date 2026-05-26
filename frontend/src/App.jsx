@@ -95,9 +95,29 @@ const NODE_PALETTE = {
       { label: "Group By & Aggregate", type: "group_agg" },
       { label: "Join Data",            type: "join_data" },
       { label: "PySpark Node",         type: "pyspark" },
+      { label: "Calculator",           type: "calc" },
+      { label: "Advance Calculator",   type: "adv_calculator" },
+      { label: "Combine Columns",      type: "combine_cols" },
     ],
   },
 };
+
+const NODE_STYLE = {
+  input_dataset:  { bg: C.blue,      text: "Source" },
+  output_dataset: { bg: C.green,     text: "Output" },
+  filter_rows:    { bg: C.blueMid,   text: "Filter" },
+  fill_null:      { bg: C.blueMid,   text: "Fill" },
+  group_agg:      { bg: C.navyLight, text: "Agg" },
+  join_data:      { bg: C.blue,      text: "Join" },
+  pyspark:        { bg: C.orange,    text: "Spark" },
+  drop_col:       { bg: C.red,       text: "Drop" },
+  // ── New Nodes ────────────────────────────────────────────────────────────
+  calc:           { bg: "#7C3AED",   text: "Calc" },    // violet
+  adv_calculator: { bg: "#4338CA",   text: "SciCalc" }, // indigo
+  combine_cols:   { bg: "#0D9488",   text: "Combine" }, // teal
+  default:        { bg: C.gold,      text: "Util" },
+};
+const nStyle = (type) => NODE_STYLE[type] || NODE_STYLE.default;
 
 const NODE_BG = {
   input_dataset: C.blue, output_dataset: C.green,
@@ -389,42 +409,30 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "" });
   const pollRef = useRef(null);
 
-  // Column propagation
+// Column propagation
   const columnMap = useMemo(() => computeNodeColumns(nodes, edges), [nodes, edges]);
 
   useEffect(() => {
-  setNodes(ns => {
     let changed = false;
-    const nextNodes = ns.map(n => {
-      const sourceEdge = edges.find(e => e.target === n.id);
-      const upstreamCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
-      const outputCols   = columnMap[n.id] || [];
-      const isConnected  = edges.some(e => e.target === n.id);
-      
-      const isUpstreamChanged = JSON.stringify(n.data.upstreamColumns) !== JSON.stringify(upstreamCols);
-      const isOutputChanged = JSON.stringify(n.data.outputColumns) !== JSON.stringify(outputCols);
-      const isConnectionChanged = n.data.isConnected !== isConnected;
-
-      if (isUpstreamChanged || isOutputChanged || isConnectionChanged) {
-        changed = true;
-        return { 
-          ...n, 
-          data: { 
-            ...n.data, 
-            upstreamColumns: upstreamCols, 
-            outputColumns: outputCols, 
-            isConnected 
-          } 
-        };
-      }
-      return n;
+    setNodes(ns => {
+      const updated = ns.map(n => {
+        const sourceEdge = edges.find(e => e.target === n.id);
+        const upstreamCols = sourceEdge ? (columnMap[sourceEdge.source] || []) : [];
+        const outputCols   = columnMap[n.id] || [];
+        const isConnected  = edges.some(e => e.target === n.id);
+        if (
+          JSON.stringify(n.data.upstreamColumns) !== JSON.stringify(upstreamCols) ||
+          JSON.stringify(n.data.outputColumns) !== JSON.stringify(outputCols) ||
+          n.data.isConnected !== isConnected
+        ) {
+          changed = true;
+          return { ...n, data: { ...n.data, upstreamColumns: upstreamCols, outputColumns: outputCols, isConnected } };
+        }
+        return n;
+      });
+      return changed ? updated : ns; // Only update state if an actual change occurred
     });
-
-    // JIKA ada perubahan nyata, kembalikan array baru.
-    // JIKA TIDAK, kembalikan referensi array lama (ns) untuk menghentikan loop.
-    return changed ? nextNodes : ns;
-  });
-}, [columnMap, edges, setNodes]);
+  }, [columnMap, edges, setNodes]);
 
   const buildCallbacks = useCallback(() => ({
     onDelete:    (nid) => setNodes(ns => ns.filter(n => n.id !== nid)),
@@ -969,6 +977,9 @@ export default function ETLPipelineApp() {
   const [uploadFile, setUploadFile] = useState(null);
   const [uploadName, setUploadName] = useState("");
   const [uploading, setUploading]   = useState(false);
+  const [uploadPct, setUploadPct]   = useState(0);
+  const [uploadMsg, setUploadMsg]   = useState("");
+  const [uploadJobId, setUploadJobId] = useState(null);
   const [dbForm, setDbForm]         = useState({ host: "postgres", port: "5432", database: "airflow", username: "airflow", password: "airflow" });
   const [dbConnecting, setDbConnecting] = useState(false);
 
@@ -1034,14 +1045,116 @@ export default function ETLPipelineApp() {
   const handleUpload = async () => {
     if (!uploadFile) return toast("Select a file first", "error");
     setUploading(true);
+    setUploadPct(0);
+    setUploadMsg("Preparing upload…");
+    setUploadJobId(null);
+
     try {
-      const r = await API.uploadDataset(uploadFile, uploadName || uploadFile.name);
-      const isLarge = r.data.is_large;
-      toast(isLarge ? "Large dataset uploaded → converted to Parquet!" : "Dataset uploaded!", "success");
-      setShowAddModal(false); setUploadFile(null); setUploadName("");
-      await loadDatasets(); await loadWarehouse();
-    } catch (e) { toast(e.response?.data?.detail || "Upload failed", "error"); }
-    finally { setUploading(false); }
+      // ── Phase 1: XHR upload with transfer progress ──────────────────
+      const formData = new FormData();
+      formData.append("file", uploadFile);
+      if (uploadName) formData.append("name", uploadName);
+
+      const jobId = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api/datasets/upload");
+
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 40); // upload = 0–40%
+            setUploadPct(pct);
+            setUploadMsg(`Uploading… ${(e.loaded / 1024 / 1024).toFixed(1)} / ${(e.total / 1024 / 1024).toFixed(1)} MB`);
+          }
+        };
+
+        xhr.onload = () => {
+          if (xhr.status === 200) {
+            try {
+              const data = JSON.parse(xhr.responseText);
+              resolve(data.job_id);
+            } catch (e) { reject(new Error("Invalid server response")); }
+          } else {
+            try {
+              const err = JSON.parse(xhr.responseText);
+              reject(new Error(err.detail || "Upload failed"));
+            } catch { reject(new Error(`Upload failed: ${xhr.status}`)); }
+          }
+        };
+
+        xhr.onerror = () => reject(new Error("Network error during upload"));
+        xhr.send(formData);
+      });
+
+      setUploadJobId(jobId);
+      setUploadPct(42);
+      setUploadMsg("File received — processing in background…");
+
+      // ── Phase 2: Poll background job status ──────────────────────────
+      let done = false;
+      let attempt = 0;
+      const MAX_POLL = 600; // 10 min max
+
+      while (!done && attempt < MAX_POLL) {
+        await new Promise(r => setTimeout(r, 1200));
+        attempt++;
+
+        try {
+          const r = await api.get(`/datasets/upload/status/${jobId}`);
+          const job = r.data;
+
+          // job.pct from worker is 5–100; we map it to 42–100 after upload phase
+          const displayPct = job.pct >= 42 ? job.pct : 42 + Math.round((job.pct / 50) * 20);
+          setUploadPct(Math.min(99, displayPct));
+          setUploadMsg(job.message || "Processing…");
+
+          if (job.status === "done") {
+            done = true;
+            setUploadPct(100);
+            const isLarge = job.is_large;
+            setUploadMsg(
+              isLarge
+                ? `✓ ${job.row_count?.toLocaleString()} rows · Parquet saved (large file)`
+                : `✓ ${job.row_count?.toLocaleString()} rows deployed`
+            );
+            toast(
+              isLarge
+                ? "Dataset uploaded & converted to Parquet!"
+                : "Dataset uploaded & deployed!",
+              "success"
+            );
+            // Brief delay so user sees 100%
+            await new Promise(r => setTimeout(r, 900));
+            setShowAddModal(false);
+            setUploadFile(null);
+            setUploadName("");
+            setUploadPct(0);
+            setUploadMsg("");
+            setUploadJobId(null);
+            await loadDatasets();
+            await loadWarehouse();
+          } else if (job.status === "error") {
+            done = true;
+            toast(`Upload failed: ${job.message}`, "error");
+            setUploadMsg(`❌ ${job.message}`);
+          }
+        } catch {}
+      }
+
+      if (!done) {
+        toast("Processing timeout — check backend logs", "error");
+      }
+
+    } catch (e) {
+      toast(e.message || "Upload failed", "error");
+      setUploadMsg(`❌ ${e.message}`);
+    } finally {
+      if (!uploadJobId) {
+        setUploading(false);
+        setUploadPct(0);
+      } else {
+        setUploading(false);
+      }
+    }
   };
 
   const handleConnectDB = async () => {
@@ -1072,11 +1185,14 @@ export default function ETLPipelineApp() {
     toast("Workflow created!", "success");
   };
 
-  const saveWorkflow = (wf) => {
+  const saveWorkflow = useCallback((wf) => {
     API.saveWorkflow(wf);
+    // Update workflows list without changing activeWorkflow reference
+    // (which would cause WorkflowEditor to re-mount and lose canvas state)
     setWorkflows(API.getWorkflows());
-    setActiveWorkflow(wf);
-  };
+    // Update activeWorkflow metadata only (not nodes/edges - they live in editor state)
+    setActiveWorkflow(prev => prev ? { ...prev, name: wf.name, description: wf.description, status: wf.status, updatedAt: wf.updatedAt } : prev);
+  }, []);
 
   const deleteWorkflow = (id) => {
     API.deleteWorkflow(id);
@@ -1109,7 +1225,16 @@ export default function ETLPipelineApp() {
     return (
       <div style={{ display: "flex", height: "100vh", fontFamily: "'DM Sans','Segoe UI',sans-serif", overflow: "hidden" }}>
         <style>{`*{box-sizing:border-box;margin:0;padding:0}`}</style>
-        <WorkflowEditor workflow={activeWorkflow} datasets={datasets} onSave={saveWorkflow} onBack={() => setActiveWorkflow(null)} toast={toast} />
+        {/* key={activeWorkflow.id} ensures WorkflowEditor fully remounts when switching workflows,
+            so useNodesState re-initializes with the correct saved nodes/edges */}
+        <WorkflowEditor
+          key={activeWorkflow.id}
+          workflow={activeWorkflow}
+          datasets={datasets}
+          onSave={saveWorkflow}
+          onBack={() => setActiveWorkflow(null)}
+          toast={toast}
+        />
         <Toast toasts={toasts} />
       </div>
     );
@@ -1429,16 +1554,63 @@ export default function ETLPipelineApp() {
           </div>
           {(addTab==="csv"||addTab==="excel") && (
             <div>
-              <label style={{ display: "block", border: `2px dashed ${uploadFile?C.blue:C.g300}`, borderRadius: 10, padding: "24px 20px", textAlign: "center", background: uploadFile?C.blueTint:C.g50, cursor: "pointer", marginBottom: 12 }}>
-                <input type="file" accept={addTab==="csv"?".csv":".xlsx,.xls"} onChange={e=>{setUploadFile(e.target.files[0]);setUploadName(e.target.files[0]?.name||"");}} style={{display:"none"}}/>
+              <label style={{ display: "block", border: `2px dashed ${uploadFile?C.blue:C.g300}`, borderRadius: 10, padding: "24px 20px", textAlign: "center", background: uploadFile?C.blueTint:C.g50, cursor: uploading?"not-allowed":"pointer", marginBottom: 12, opacity: uploading ? 0.7 : 1 }}>
+                <input type="file" accept={addTab==="csv"?".csv":".xlsx,.xls"} disabled={uploading} onChange={e=>{setUploadFile(e.target.files[0]);setUploadName(e.target.files[0]?.name||"");}} style={{display:"none"}}/>
                 <div style={{fontSize:26,marginBottom:6}}>{uploadFile?"✅":"📁"}</div>
                 <div style={{fontWeight:700,color:uploadFile?C.blue:C.g600,fontSize:13}}>{uploadFile?uploadFile.name:`Drop your ${addTab.toUpperCase()} file here`}</div>
-                <div style={{fontSize:11,color:C.g400,marginTop:3}}>{uploadFile?`${(uploadFile.size/1024).toFixed(1)} KB`:"or click to browse"}</div>
+                <div style={{fontSize:11,color:C.g400,marginTop:3}}>
+                  {uploadFile
+                    ? `${(uploadFile.size/1024/1024).toFixed(2)} MB${uploadFile.size >= 5*1024*1024*1024 ? " · ⚡ Will convert to Parquet" : ""}`
+                    : "or click to browse"}
+                </div>
               </label>
-              <div style={{ background: C.sparkTint, borderRadius: 7, padding: "8px 12px", fontSize: 11, color: C.spark, marginBottom: 12 }}>
-                ⚡ Files larger than 10GB will be automatically converted to Parquet format
-              </div>
-              <input value={uploadName} onChange={e=>setUploadName(e.target.value)} placeholder="Dataset name (optional)" style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${C.g200}`,fontSize:13,boxSizing:"border-box",outline:"none",color:C.g700}}/>
+
+              {/* File size warning for large files */}
+              {uploadFile && uploadFile.size >= 5*1024*1024*1024 && (
+                <div style={{ background: C.sparkTint, border: `1px solid ${C.spark}33`, borderRadius: 8, padding: "8px 12px", fontSize: 11, color: C.spark, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+                  <Ic.Spark />
+                  <span><strong>Large file ≥ 5 GB</strong> — will be automatically converted to Parquet format for efficient storage & fast queries.</span>
+                </div>
+              )}
+
+              {/* Progress bar */}
+              {uploading && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.g600, marginBottom: 5, fontWeight: 600 }}>
+                    <span>{uploadMsg || "Processing…"}</span>
+                    <span style={{ color: C.blue, fontWeight: 800 }}>{uploadPct}%</span>
+                  </div>
+                  <div style={{ height: 8, background: C.g200, borderRadius: 99, overflow: "hidden" }}>
+                    <div style={{
+                      height: "100%",
+                      width: `${uploadPct}%`,
+                      borderRadius: 99,
+                      background: uploadPct === 100
+                        ? `linear-gradient(90deg,${C.green},#15803d)`
+                        : `linear-gradient(90deg,${C.blue},${C.spark})`,
+                      transition: "width 0.4s ease",
+                    }} />
+                  </div>
+                  {/* Phase indicators */}
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                    {[
+                      { label: "Upload", start: 0, end: 42 },
+                      { label: "Parse", start: 42, end: 55 },
+                      { label: "Parquet", start: 55, end: 65 },
+                      { label: "Insert DB", start: 65, end: 97 },
+                      { label: "Done", start: 97, end: 100 },
+                    ].map(ph => (
+                      <div key={ph.label} style={{
+                        fontSize: 9,
+                        color: uploadPct >= ph.start ? (uploadPct >= ph.end ? C.green : C.blue) : C.g300,
+                        fontWeight: uploadPct >= ph.start && uploadPct < ph.end ? 800 : 400,
+                      }}>{ph.label}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <input value={uploadName} disabled={uploading} onChange={e=>setUploadName(e.target.value)} placeholder="Dataset name (optional)" style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${C.g200}`,fontSize:13,boxSizing:"border-box",outline:"none",color:C.g700, opacity: uploading ? 0.6 : 1}}/>
             </div>
           )}
           {(addTab==="postgres"||addTab==="mysql") && (
@@ -1452,11 +1624,21 @@ export default function ETLPipelineApp() {
             </div>
           )}
           <div style={{display:"flex",gap:8,marginTop:18}}>
-            <button onClick={()=>setShowAddModal(false)} style={{flex:1,padding:"9px 0",borderRadius:8,border:`1px solid ${C.g200}`,background:C.white,color:C.g600,fontSize:13,fontWeight:600,cursor:"pointer"}}>Cancel</button>
-            <button onClick={addTab==="csv"||addTab==="excel"?handleUpload:handleConnectDB} disabled={uploading||dbConnecting} style={{flex:1,padding:"9px 0",borderRadius:8,background:uploading||dbConnecting?C.g300:`linear-gradient(90deg,${C.blue},${C.blueMid})`,border:"none",color:C.white,fontSize:13,fontWeight:700,cursor:uploading||dbConnecting?"not-allowed":"pointer"}}>
-              {uploading||dbConnecting?"Please wait…":addTab==="csv"||addTab==="excel"?"Upload & Deploy":"Test & Connect"}
+            <button onClick={()=>{ if(!uploading){ setShowAddModal(false); setUploadFile(null); setUploadName(""); setUploadPct(0); setUploadMsg(""); }}} disabled={uploading && uploadPct < 100} style={{flex:1,padding:"9px 0",borderRadius:8,border:`1px solid ${C.g200}`,background:C.white,color:C.g600,fontSize:13,fontWeight:600,cursor:"pointer"}}>
+              {uploading ? "Processing…" : "Cancel"}
+            </button>
+            <button onClick={addTab==="csv"||addTab==="excel"?handleUpload:handleConnectDB} disabled={uploading||dbConnecting} style={{flex:2,padding:"9px 0",borderRadius:8,background:uploading||dbConnecting?C.g200:`linear-gradient(90deg,${C.blue},${C.blueMid})`,border:"none",color:uploading||dbConnecting?C.g500:C.white,fontSize:13,fontWeight:700,cursor:uploading||dbConnecting?"not-allowed":"pointer",position:"relative",overflow:"hidden"}}>
+              {uploading ? (
+                <span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+                  <span style={{display:"inline-block",width:12,height:12,border:`2px solid ${C.g400}`,borderTopColor:C.blue,borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
+                  {uploadPct}% — {uploadPct < 42 ? "Uploading…" : uploadPct < 65 ? "Parsing…" : uploadPct < 97 ? "Inserting…" : "Finalizing…"}
+                </span>
+              ) : (
+                addTab==="csv"||addTab==="excel" ? "Upload & Deploy" : (dbConnecting ? "Connecting…" : "Test & Connect")
+              )}
             </button>
           </div>
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
         </Modal>
       )}
 

@@ -105,6 +105,44 @@ export function applyColumnTransform(type, config, inputCols) {
       return [...groupCols, ...aggAliases];
     }
 
+        // ── Calculator Node ────────────────────────────────────────────────────
+    // Adds 1 new column (or replaces if same name exists)
+    case "calc": {
+      const newCol = config?.newColName?.trim();
+      if (!newCol) return inputCols;
+      if (inputCols.includes(newCol)) return inputCols; // replace → same cols
+      return [...inputCols, newCol];
+    }
+ 
+    // ── Advance Calculator Node ────────────────────────────────────────────
+    // Adds N new columns (one per calculation row)
+    case "adv_calculator": {
+      const calculations = config?.calculations || [];
+      let cols = [...inputCols];
+      for (const calc of calculations) {
+        const newCol = calc.newColName?.trim();
+        if (newCol && !cols.includes(newCol)) {
+          cols = [...cols, newCol];
+        }
+      }
+      return cols;
+    }
+ 
+    // ── Combine Columns Node ───────────────────────────────────────────────
+    // Optionally removes source cols, adds 1 new combined col
+    case "combine_cols": {
+      const newCol         = config?.newColName?.trim();
+      const removeOriginal = config?.removeOriginal || false;
+      const selectedCols   = new Set(config?.selectedCols || []);
+      let cols = removeOriginal
+        ? inputCols.filter(c => !selectedCols.has(c))
+        : [...inputCols];
+      if (newCol && !cols.includes(newCol)) {
+        cols = [...cols, newCol];
+      }
+      return cols;
+    }
+
     case "join_data": {
       // Join adds columns dari kedua tabel (simplifikasi: pass through saja)
       return normalized;
@@ -119,6 +157,7 @@ export function applyColumnTransform(type, config, inputCols) {
       return normalized;
   }
 }
+
 
 /**
  * Simple topological sort of nodes based on edges.
