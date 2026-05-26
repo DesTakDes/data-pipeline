@@ -50,6 +50,10 @@ def ensure_schemas(cur, conn):
     cur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
     conn.commit()
 
+// Unique ID generator — counter + timestamp + random suffix
+let _idSeq = 0;
+const genId = () => `n${Date.now()}_${++_idSeq}_${Math.random().toString(36).slice(2, 6)}`;
+
 # ── Health ──────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -426,23 +430,38 @@ def run_pipeline(payload: dict):
 
     # Wait for DAG detection
     if not dag_exists:
-        for i in range(20):
-            time.sleep(2)
+        detected = False
+        for i in range(30):          # max 30 detik
+            time.sleep(1)
             try:
-                r = requests.get(f"{airflow_url}/api/v1/dags/{dag_id}", auth=airflow_auth, timeout=5)
-                if r.status_code == 200:
+                r = requests.get(
+                    f"{airflow_url}/api/v1/dags/{dag_id}",
+                    auth=airflow_auth, timeout=5
+                )
+                if r.status_code == 200 and r.json().get("dag_id"):
+                    detected = True
+                    print(f"[DAG] Detected after {i+1}s")
                     break
             except:
                 pass
+        if not detected:
+            print(f"[DAG] Warning: {dag_id} not detected after 30s — triggering anyway")
     else:
-        time.sleep(3)
-        try:
-            requests.patch(f"{airflow_url}/api/v1/dags/{dag_id}", auth=airflow_auth,
-                           json={"is_paused": False}, timeout=5)
-        except:
-            pass
+        time.sleep(1)
 
-    # Trigger DAG
+    # Unpause dulu sebelum trigger (WAJIB!)
+    try:
+        requests.patch(
+            f"{airflow_url}/api/v1/dags/{dag_id}",
+            auth=airflow_auth,
+            json={"is_paused": False},
+            timeout=5
+        )
+        time.sleep(1)   # beri waktu unpause diproses
+    except Exception as e:
+        print(f"[DAG] Unpause failed: {e}")
+
+    # Baru trigger
     try:
         r = requests.post(
             f"{airflow_url}/api/v1/dags/{dag_id}/dagRuns",
@@ -451,6 +470,7 @@ def run_pipeline(payload: dict):
             timeout=10
         )
         dag_run = r.json()
+        print(f"[DAG] Trigger response: {r.status_code} — {dag_run}")
     except Exception as e:
         dag_run = {"error": str(e)}
 
