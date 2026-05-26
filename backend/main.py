@@ -416,6 +416,9 @@ def run_pipeline(payload: dict):
 
         for task in tasks:
             safe_out = re.sub(r'[^a-z0-9_]', '_', task.get("output_name","output").lower())
+            if safe_out and safe_out[0].isdigit():
+                safe_out = 't_' + safe_out
+            safe_out = safe_out or 'output'
             cur.execute("""
                 INSERT INTO meta.pipeline_runs
                     (dag_id, task_id, workflow_id, workflow_name, input_table, output_table, status)
@@ -843,6 +846,9 @@ def run_task(task_def, **context):
     safe_output = output_name.lower().replace(" ", "_")
     import re as _re
     safe_output = _re.sub(r\'[^a-z0-9_]\', \'_\', safe_output)
+    if safe_output and safe_output[0].isdigit():
+        safe_output = \'t_\' + safe_output
+    safe_output = safe_output or \'output\'
 
     # Detect input size
     tbl = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{INPUT_TABLE}"
