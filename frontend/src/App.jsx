@@ -7,8 +7,17 @@ import {
 import "@xyflow/react/dist/style.css";
 import axios from "axios";
 import { computeNodeColumns, getUpstreamColumns } from "./NodePropagation";
+import {
+  getWorkflows,
+  saveWorkflow   as saveWfToCache,
+  deleteWorkflow as deleteWfFromCache,
+} from "./workflowCache";
 
 const api = axios.create({ baseURL: "/api" });
+
+// Unique ID generator — counter + timestamp + random suffix
+let _idSeq = 0;
+const genId = () => `n${Date.now()}_${++_idSeq}_${Math.random().toString(36).slice(2, 6)}`;
 
 const API = {
   getDatasets:    ()      => api.get("/datasets").catch(() => ({ data: [] })),
@@ -21,9 +30,9 @@ const API = {
   },
   connectDB:      (p) => api.post("/datasets/connect-db", p),
   previewTransform:(payload) => api.post("/preview/transform", payload),
-  getWorkflows:   ()  => { try { return JSON.parse(localStorage.getItem("etl_workflows_v2") || "[]"); } catch { return []; } },
-  saveWorkflow:   (w) => { const ws = API.getWorkflows().filter(x => x.id !== w.id); ws.push(w); localStorage.setItem("etl_workflows_v2", JSON.stringify(ws)); return w; },
-  deleteWorkflow: (id)=> { const ws = API.getWorkflows().filter(x => x.id !== id); localStorage.setItem("etl_workflows_v2", JSON.stringify(ws)); },
+  getWorkflows:   () => getWorkflows(),
+  saveWorkflow:   (w)  => saveWfToCache(w),
+  deleteWorkflow: (id) => deleteWfFromCache(id),
   getWarehouseTables: () => api.get("/warehouse/tables").catch(() => ({ data: [] })),
   runPipeline:    (payload) => api.post("/pipelines/run", payload),
   getPipelineRuns:()       => api.get("/pipelines/runs").catch(() => ({ data: [] })),
@@ -391,13 +400,27 @@ function Modal({ title, onClose, children, width = 480 }) {
     </div>
   );
 }
+// Taruh di atas WorkflowEditor function, setelah imports
+export const toDagId = (name) =>
+  (name || "untitled_workflow")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/, "");
 
 // ── Workflow Editor ────────────────────────────────────────────────────────────
 function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
+    if (!workflow?.id) {
+    return (
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"center",
+        height:"100vh", color: C.g400, fontSize: 14 }}>
+        Loading workflow…
+      </div>
+    );
+  }
   const [nodes, setNodes, onNodesChange] = useNodesState(workflow.nodes || []);
   const [edges, setEdges, onEdgesChange] = useEdgesState(workflow.edges || []);
   const [wfTab, setWfTab]       = useState("datasets");
-  const [counter, setCounter]   = useState(100);
   const [running, setRunning]   = useState(false);
   const [dagStatus, setDagStatus] = useState(null);
   const [taskStates, setTaskStates] = useState({});
@@ -438,8 +461,16 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     onDelete:    (nid) => setNodes(ns => ns.filter(n => n.id !== nid)),
     onDuplicate: (nid) => setNodes(ns => {
       const o = ns.find(n => n.id === nid); if (!o) return ns;
-      return [...ns, { ...o, id: `n${Date.now()}`, position: { x: o.position.x + 30, y: o.position.y + 30 } }];
+      const newId = genId();
+      const cbs = buildCallbacks();
+      return [...ns, {
+        ...o,
+        id: newId,
+        position: { x: o.position.x + 30, y: o.position.y + 30 },
+        data: { ...o.data, ...cbs },
+      }];
     }),
+
     onConfigure: (nid) => setNodes(ns => {
       const n = ns.find(x => x.id === nid); if (!n) return ns;
       const isIO = ["input_dataset","output_dataset"].includes(n.data.type);
@@ -493,15 +524,15 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   }, []);
 
   const addNode = useCallback((item) => {
-    const id  = `n${counter}`;
+    const id = genId();
     const cbs = buildCallbacks();
-    setCounter(c => c + 1);
+    // hapus setCounter karena tidak dipakai lagi
     setNodes(ns => [...ns, {
       id, type: "etlNode",
-      position: { x: 80 + (counter % 4) * 230, y: 60 + Math.floor(counter / 4) * 180 },
+      position: { x: 80 + (ns.length % 4) * 230, y: 60 + Math.floor(ns.length / 4) * 180 },
       data: { label: item.label, type: item.type, config: null, columns: [], upstreamColumns: [], outputColumns: [], isConnected: false, ...cbs },
     }]);
-  }, [counter, buildCallbacks]);
+  }, [buildCallbacks]);
 
   const onConnect = useCallback(
     p => setEdges(es => addEdge({ ...p, animated: true, style: { stroke: C.blue, strokeWidth: 2 } }, es)),
@@ -765,7 +796,11 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
                 <div style={{ background: C.sparkTint, borderBottom: `1px solid ${C.spark}22`, padding: "8px 16px" }}>
                   <div style={{ fontSize: 10, color: C.spark, fontWeight: 700 }}>⚡ DAG Name</div>
                   <div style={{ fontSize: 12, fontFamily: "monospace", color: C.navy, fontWeight: 700, marginTop: 2 }}>{
-                    workflow.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/_+/g,"_").replace(/^_|_$/g,"")
+                    (workflow.name || "untitled_workflow")
+                      .toLowerCase()
+                      .replace(/[^a-z0-9_]/g,"_")
+                      .replace(/_+/g,"_")
+                      .replace(/^_|_$/g,"")
                   }</div>
                   <div style={{ fontSize: 9, color: C.g400, marginTop: 1 }}>Each output node = one task in this DAG</div>
                 </div>
@@ -1004,11 +1039,16 @@ export default function ETLPipelineApp() {
   }, []);
 
   useEffect(() => {
-    axios.get("/airflow-api/health").then(() => setAirflowOk(true)).catch(() => setAirflowOk(false));
+      // Workflow: INSTANT dari cache (tidak perlu await)
+    setWorkflows(API.getWorkflows());
+
+    // Airflow health: fire and forget
+    axios.get("/airflow-api/health")
+      .then(() => setAirflowOk(true))
+      .catch(() => setAirflowOk(false));
     loadDatasets();
     loadWarehouse();
-    setWorkflows(API.getWorkflows());
-  }, []);
+    }, []);
 
   const loadDatasets = async () => {
     setDsLoading(true);
@@ -1173,9 +1213,14 @@ export default function ETLPipelineApp() {
   const createWorkflow = () => {
     if (!newWfForm.name.trim()) return toast("Workflow name required", "error");
     const wf = {
-      id: `wf_${Date.now()}`, name: newWfForm.name, description: newWfForm.description,
-      nodes: [], edges: [], status: "draft",
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      id:          `wf_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
+      name:        newWfForm.name.trim(),   // ← trim() pastikan tidak whitespace
+      description: newWfForm.description || "",
+      nodes:       [],
+      edges:       [],
+      status:      "draft",
+      createdAt:   new Date().toISOString(),
+      updatedAt:   new Date().toISOString(),
     };
     API.saveWorkflow(wf);
     setWorkflows(API.getWorkflows());
@@ -1187,11 +1232,14 @@ export default function ETLPipelineApp() {
 
   const saveWorkflow = useCallback((wf) => {
     API.saveWorkflow(wf);
-    // Update workflows list without changing activeWorkflow reference
-    // (which would cause WorkflowEditor to re-mount and lose canvas state)
     setWorkflows(API.getWorkflows());
-    // Update activeWorkflow metadata only (not nodes/edges - they live in editor state)
-    setActiveWorkflow(prev => prev ? { ...prev, name: wf.name, description: wf.description, status: wf.status, updatedAt: wf.updatedAt } : prev);
+    setActiveWorkflow(prev => prev ? {
+      ...prev,
+      name:        wf.name        || prev.name || "Untitled Workflow",
+      description: wf.description ?? prev.description,
+      status:      wf.status      || prev.status,
+      updatedAt:   wf.updatedAt   || new Date().toISOString(),
+    } : prev);
   }, []);
 
   const deleteWorkflow = (id) => {
@@ -1201,13 +1249,15 @@ export default function ETLPipelineApp() {
   };
 
   const filteredDS = datasets.filter(d => {
-    const ms = d.name.toLowerCase().includes(searchQ.toLowerCase());
-    const mt = filterType === "all" || d.type?.toLowerCase() === filterType;
+    if (!d || !d.id) return false;
+    const ms = (d.name || "").toLowerCase().includes(searchQ.toLowerCase());
+    const mt = filterType === "all" || (d.type || "").toLowerCase() === filterType;
     return ms && mt;
   });
 
   const filteredWF = workflows.filter(w => {
-    const ms = w.name.toLowerCase().includes(wfSearch.toLowerCase());
+    if (!w || !w.id) return false; // buang data corrupt
+    const ms = (w.name || "").toLowerCase().includes(wfSearch.toLowerCase());
     const mt = wfFilter === "all" || w.status === wfFilter;
     return ms && mt;
   });

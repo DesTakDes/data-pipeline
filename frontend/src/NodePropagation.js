@@ -77,11 +77,7 @@ export function applyColumnTransform(type, config, inputCols) {
 
     case "rename_col": {
       const renames = config?.renames || {};
-      return normalized.map(c => {
-        // Cari apakah ada rename untuk kolom ini
-        const rename = renames.find(r => r.old_name === c);
-        return rename ? rename.new_name : c;
-      });
+      return normalized.map(c => renames[c] || c);
     }
 
     case "add_const": {
