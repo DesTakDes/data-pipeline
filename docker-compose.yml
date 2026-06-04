@@ -17,7 +17,7 @@ x-airflow-common: &airflow-common
     SPARK_HOME: /opt/spark
 
   volumes:
-    - ./dags:/opt/airflow/dags
+    - ./airflow-dags:/opt/airflow/dags
     - ./spark-jobs:/opt/airflow/spark-jobs
     - ./data_csv:/opt/airflow/data_csv
     - airflow_logs:/opt/airflow/logs
@@ -47,7 +47,7 @@ services:
         condition: service_healthy
     volumes:
       - ./data_csv:/data_csv
-      - ./dags:/opt/airflow/dags 
+      - ./airflow-dags:/opt/airflow/dags 
     restart: unless-stopped
 
   # ── PostgreSQL ───────────────────────────────────────────────────────────────
@@ -143,3 +143,4 @@ services:
 volumes:
   postgres_data:
   airflow_logs:
+  airflow-dags:

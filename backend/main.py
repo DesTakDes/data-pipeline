@@ -822,17 +822,87 @@ def get_schema(pg, table_name):
 def q(cols):
     return ", ".join(f\'"{c}"\' for c in cols)
 
-def detect_spark_config(row_count, col_count=10):
-    """Heuristic-based Spark resource sizing."""
-    estimated_mb = row_count * col_count * 50 / (1024 * 1024)
-    if estimated_mb < 100:
-        return {"executor_memory": "1g", "executor_cores": 1, "num_executors": 1, "dynamic": False}
-    elif estimated_mb < 1000:
-        return {"executor_memory": "2g", "executor_cores": 2, "num_executors": 2, "dynamic": False}
-    elif estimated_mb < 10000:
-        return {"executor_memory": "4g", "executor_cores": 4, "num_executors": 4, "dynamic": True}
+def build_dynamic_spark_config(estimated_mb, cluster):
+    """
+    Hitung config berdasarkan:
+    - estimated_mb : ukuran data actual (dari sampling)
+    - cluster      : resource real dari Spark master API
+    
+    Prinsip:
+    - Jangan pakai lebih dari 75% total cluster memory (sisakan untuk overhead)
+    - Jangan pakai lebih dari 80% total cores
+    - Kalau data kecil, pakai minimal (hemat resource untuk job lain)
+    - Kalau data besar, scale up proporsional
+    """
+    safe_mem_mb  = cluster["total_mem_mb"]  * 0.75
+    safe_cores   = max(1, int(cluster["total_cores"] * 0.80))
+    workers      = max(1, cluster["worker_count"])
+
+    # --- Tentukan "tier" berdasarkan ukuran data ---
+    if estimated_mb < 50:
+        # Tiny: 1 executor, memory minimal
+        # Tidak perlu Spark overhead → sarankan PostgreSQL
+        return {
+            "use_spark":        False,  # ← key flag
+            "reason":           f"Data only {estimated_mb:.1f}MB, PostgreSQL faster",
+            "executor_memory":  "512m",
+            "executor_cores":   1,
+            "num_executors":    1,
+            "dynamic":          False,
+            "partitions":       1,
+        }
+
+    elif estimated_mb < 500:
+        # Small: 1-2 executors, memory rendah
+        mem_per_exec = min(1024, int(safe_mem_mb / workers))
+        mem_per_exec = max(512, mem_per_exec)
+        return {
+            "use_spark":        True,
+            "executor_memory":  f"{mem_per_exec}m",
+            "executor_cores":   min(2, safe_cores),
+            "num_executors":    min(2, workers),
+            "dynamic":          False,
+            "partitions":       2,
+        }
+
+    elif estimated_mb < 5000:
+        # Medium: scale proporsional
+        needed_executors = max(2, min(workers, int(estimated_mb / 500)))
+        mem_per_exec     = min(4096, int(safe_mem_mb / needed_executors))
+        mem_per_exec     = max(1024, mem_per_exec)
+        cores_per_exec   = max(1, safe_cores // needed_executors)
+        partitions       = max(4, needed_executors * cores_per_exec * 2)
+
+        return {
+            "use_spark":        True,
+            "executor_memory":  f"{mem_per_exec}m",
+            "executor_cores":   cores_per_exec,
+            "num_executors":    needed_executors,
+            "dynamic":          True,
+            "partitions":       partitions,
+        }
+
     else:
-        return {"executor_memory": "8g", "executor_cores": 8, "num_executors": 8, "dynamic": True}
+        # Large: maksimalkan semua resource
+        mem_per_exec = min(8192, int(safe_mem_mb / workers))
+        mem_per_exec = max(2048, mem_per_exec)
+        partitions   = max(8, safe_cores * 3)  # 3x cores = good parallelism
+
+        return {
+            "use_spark":        True,
+            "executor_memory":  f"{mem_per_exec}m",
+            "executor_cores":   safe_cores // max(1, workers),
+            "num_executors":    workers,
+            "dynamic":          True,
+            "partitions":       partitions,
+            "extra_configs": {
+                # Untuk dataset > 5GB, aktifkan optimasi tambahan
+                "spark.sql.shuffle.partitions":          str(partitions),
+                "spark.sql.adaptive.skewJoin.enabled":   "true",
+                "spark.memory.fraction":                 "0.8",
+                "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+            }
+        }
 
 def run_task(task_def, **context):
     import subprocess
@@ -868,6 +938,33 @@ def run_task(task_def, **context):
     print(f"[Spark] Task: {task_id} | Rows: {row_count} | Cols: {col_count}")
     print(f"[Spark] Config: {spark_cfg}")
 
+    estimated_mb = estimate_real_size_mb(pg, tbl, row_count)
+    cluster      = get_available_spark_resources()
+    spark_cfg    = build_dynamic_spark_config(estimated_mb, cluster)
+
+    print(f"[Resource] Estimated size: {estimated_mb:.1f}MB")
+    print(f"[Resource] Cluster: {cluster}")
+    print(f"[Resource] Config selected: {spark_cfg}")
+
+    if not spark_cfg.get("use_spark", True):
+        print(f"[Route] → PostgreSQL (reason: {spark_cfg.get('reason')})")
+        run_with_postgres(pg, tbl, safe_output, transforms, task_id, row_count)
+    else:
+        # Cek apakah PySpark benar-benar tersedia
+        spark_available = False
+        try:
+            import importlib.util
+            spark_available = importlib.util.find_spec("pyspark") is not None
+        except:
+            pass
+
+        if spark_available:
+            print(f"[Route] → Spark ({estimated_mb:.1f}MB, {cluster['total_cores']} cores available)")
+            run_with_spark(pg, tbl, safe_output, transforms, row_count, spark_cfg, task_id)
+        else:
+            print("[Route] → PostgreSQL fallback (PySpark not installed)")
+            run_with_postgres(pg, tbl, safe_output, transforms, task_id, row_count)
+
     # Try PySpark if available, else fallback to PostgreSQL transforms
     spark_available = False
     try:
@@ -894,6 +991,49 @@ def run_task(task_def, **context):
 
     print(f"[Done] Task {task_id} → {out} ({count} rows)")
 
+def estimate_real_size_mb(pg, table, row_count):
+    """Sample 1000 rows, ukur actual size, ekstrapolasi ke full dataset."""
+    sample = min(1000, row_count)
+    rows = pg.get_records(f"SELECT * FROM {table} LIMIT {sample}")
+    
+    import sys
+    sample_bytes = sum(sys.getsizeof(str(r)) for r in rows)
+    avg_row_bytes = sample_bytes / max(sample, 1)
+    
+    estimated_mb = (avg_row_bytes * row_count) / (1024 * 1024)
+    return estimated_mb
+
+def get_available_spark_resources():
+    """
+    Query Spark master API untuk tahu resource yang benar-benar tersedia.
+    Jangan hardcode asumsi cluster.
+    """
+    import requests
+    try:
+        r = requests.get("http://spark:8080/json/", timeout=3)
+        data = r.json()
+        
+        alive_workers = [w for w in data.get("workers", []) if w["state"] == "ALIVE"]
+        total_cores   = sum(w["cores"] for w in alive_workers)
+        # Spark API return memory dalam MB
+        total_mem_mb  = sum(w["memory"] for w in alive_workers)
+        
+        return {
+            "total_cores":  total_cores,
+            "total_mem_mb": total_mem_mb,
+            "worker_count": len(alive_workers),
+            "available":    total_cores > 0,
+        }
+    except Exception as e:
+        print(f"[Spark] Cannot reach master API: {e}")
+        # Fallback ke minimum safe config
+        return {
+            "total_cores":  2,
+            "total_mem_mb": 2048,
+            "worker_count": 1,
+            "available":    False,  # flag: pakai PostgreSQL fallback saja
+        }
+
 
 def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cfg, task_id):
     from pyspark.sql import SparkSession
@@ -901,21 +1041,28 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     from pyspark.sql.types import StringType, LongType, DoubleType, BooleanType, DateType, TimestampType
 
     # Build SparkSession with right-sized resources
-    builder = SparkSession.builder \\
-        .appName(f"ETLFlow_{DAG_ID}_{task_id}") \\
-        .config("spark.master", "spark://spark:7077") \\
-        .config("spark.jars", "/opt/spark/jars/postgresql-42.6.0.jar") \\
-        .config("spark.executor.memory", spark_cfg["executor_memory"]) \\
-        .config("spark.executor.cores", str(spark_cfg["executor_cores"])) \\
-        .config("spark.sql.adaptive.enabled", "true") \\
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \\
-        .config("spark.sql.broadcastTimeout", "300")
+    builder = SparkSession.builder \
+        .appName(f"ETLFlow_{DAG_ID}_{task_id}") \
+        .config("spark.master", "spark://spark:7077") \
+        .config("spark.jars", "/opt/spark/jars/postgresql-42.6.0.jar") \
+        .config("spark.executor.memory",  spark_cfg["executor_memory"]) \
+        .config("spark.executor.cores",   str(spark_cfg["executor_cores"])) \
+        .config("spark.sql.adaptive.enabled", "true") \
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
 
     if spark_cfg.get("dynamic"):
-        builder = builder \\
-            .config("spark.dynamicAllocation.enabled", "true") \\
-            .config("spark.dynamicAllocation.minExecutors", "1") \\
+        builder = builder \
+            .config("spark.dynamicAllocation.enabled",    "true") \
+            .config("spark.dynamicAllocation.minExecutors", "1") \
             .config("spark.dynamicAllocation.maxExecutors", str(spark_cfg["num_executors"]))
+    else:
+        # Static allocation: lebih predictable untuk small jobs
+        builder = builder \
+            .config("spark.dynamicAllocation.enabled", "false") \
+            .config("spark.executor.instances", str(spark_cfg["num_executors"]))
+
+    for k, v in spark_cfg.get("extra_configs", {}).items():
+        builder = builder.config(k, v)
 
     spark = builder.getOrCreate()
 
@@ -924,27 +1071,29 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     jdbc_props = {"user": "airflow", "password": "airflow", "driver": "org.postgresql.Driver"}
 
     # Determine optimal partitions
-    num_partitions = max(1, min(8, row_count // 100000))
+    num_partitions = spark_cfg.get("partitions", 4)
+
+    jdbc_url   = "jdbc:postgresql://postgres:5432/airflow"
+    jdbc_props = {"user": "airflow", "password": "airflow", "driver": "org.postgresql.Driver"}
 
     df = spark.read.jdbc(
-        url=jdbc_url, table=f"(SELECT * FROM {input_table}) AS t",
-        numPartitions=num_partitions, properties=jdbc_props
+        url=jdbc_url,
+        table=f"(SELECT * FROM {input_table}) AS t",
+        numPartitions=num_partitions,
+        properties=jdbc_props
     )
 
-    # Apply transforms
     df = apply_spark_transforms(spark, df, transforms)
 
-    # Partitioning & format optimization
-    if row_count > 1000000:
-        df = df.repartition(max(4, num_partitions))
-    elif row_count > 100000:
-        df = df.coalesce(max(2, num_partitions // 2))
+    # Repartition strategy berdasarkan config
+    if num_partitions > 4:
+        df = df.repartition(num_partitions)
+    elif num_partitions > 1:
+        df = df.coalesce(num_partitions)
 
-    # Cache if multiple operations needed
     if len(transforms) > 3:
         df.cache()
 
-    # Write to warehouse via JDBC
     df.write.jdbc(
         url=jdbc_url,
         table=f"warehouse.{output_name}",
@@ -952,12 +1101,10 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
         properties=jdbc_props
     )
 
-    # Also save as Parquet for large datasets
-    if row_count > 100000:
+    if row_count > 100_000:
         parquet_path = f"/data_csv/parquet/{output_name}.parquet"
         os.makedirs("/data_csv/parquet", exist_ok=True)
         df.write.mode("overwrite").parquet(parquet_path)
-        print(f"[Spark] Saved Parquet: {parquet_path}")
 
     spark.stop()
 

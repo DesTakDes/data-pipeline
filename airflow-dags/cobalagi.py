@@ -1,6 +1,6 @@
-# Auto-generated Spark DAG: maya
-# Workflow: maya
-# Generated: 2026-05-21T03:16:49.853873
+# Auto-generated Spark DAG: cobalagi
+# Workflow: cobalagi
+# Generated: 2026-06-03T23:00:53.992000
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -8,10 +8,10 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
 import json, requests, os, math
 
-DAG_ID      = 'maya'
-INPUT_TABLE = 'staging.subway'
-WORKFLOW_ID = 'wf_1779332822879'
-TASKS_DEF   = json.loads('[{"task_id": "task_1926", "output_name": "sa", "transforms": [{"type": "select_col", "config": {"columns": ["index", "zip_code", "name", "url", "street_address"]}}], "depends_on": []}]')
+DAG_ID      = 'cobalagi'
+INPUT_TABLE = 'staging.supermarket_dataset_1gb'
+WORKFLOW_ID = 'wf_1780384715536_o8qt'
+TASKS_DEF   = json.loads('[{"task_id": "task_6522", "output_name": "destatest1", "transforms": [{"type": "rename_col", "config": {"renames": {"category": "kategori", "quantity": "kuantitas"}}}, {"type": "drop_col", "config": {"columns": ["transaction_id", "store_id"]}}], "depends_on": []}]')
 BACKEND_URL = "http://backend:8000"
 
 default_args = {"owner": "etlflow", "retries": 0}
@@ -143,8 +143,9 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     num_partitions = max(1, min(8, row_count // 100000))
 
     df = spark.read.jdbc(
-        url=jdbc_url, table=f"(SELECT * FROM {input_table}) AS t",
-        numPartitions=num_partitions, properties=jdbc_props
+        url=jdbc_url,
+        table=f"(SELECT * FROM {input_table}) AS t",
+        properties=jdbc_props,
     )
 
     # Apply transforms
@@ -159,11 +160,15 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     # Cache if multiple operations needed
     if len(transforms) > 3:
         df.cache()
-
+    
+    jdbc_url_warehouse = (
+        "jdbc:postgresql://postgres:5432/airflow"
+        f"?currentSchema=warehouse"
+    )
     # Write to warehouse via JDBC
     df.write.jdbc(
-        url=jdbc_url,
-        table=f"warehouse.{output_name}",
+        url=jdbc_url_warehouse,
+        table=f'"{output_name}"',   # nama tabel saja, tanpa skema
         mode="overwrite",
         properties=jdbc_props
     )
@@ -373,12 +378,12 @@ def run_with_postgres(pg, input_table, output_name, transforms, task_id, row_cou
 
 
 with DAG(
-    dag_id='maya',
+    dag_id='cobalagi',
     default_args=default_args,
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["etl", "spark", "generated", 'wf_1779332822879'],
+    tags=["etl", "spark", "generated", 'wf_1780384715536_o8qt'],
     description='',
 ) as dag:
     airflow_tasks = {}

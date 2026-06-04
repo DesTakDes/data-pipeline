@@ -1,6 +1,6 @@
-# Auto-generated Spark DAG: lada
-# Workflow: lada
-# Generated: 2026-05-21T03:43:54.161138
+# Auto-generated Spark DAG: try6
+# Workflow: try6
+# Generated: 2026-05-27T14:34:37.256912
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -8,10 +8,10 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
 import json, requests, os, math
 
-DAG_ID      = 'lada'
-INPUT_TABLE = 'staging.subway'
-WORKFLOW_ID = 'wf_1779334900081'
-TASKS_DEF   = json.loads('[{"task_id": "task_3068", "output_name": "gai", "transforms": [{"type": "join_data", "config": {"joinType": "LEFT JOIN", "leftCol": "name", "rightCol": "spending_score_(1_100)", "rightNodeId": "n101"}}, {"type": "fill_null", "config": {"columns": ["index", "name", "url", "street_address", "city", "state", "zip_code", "country", "phone_number_1", "phone_number_2", "fax_1", "fax_2", "email_1", "email_2", "website", "open_hours", "latitude", "longitude", "facebook", "twitter", "instagram", "pinterest", "youtube"], "fillValue": "", "fillType": "mean"}}], "depends_on": []}]')
+DAG_ID      = 'try6'
+INPUT_TABLE = 'staging.online_sales_data'
+WORKFLOW_ID = 'wf_1779779554153_aaej'
+TASKS_DEF   = json.loads('[{"task_id": "task_0786", "output_name": "d", "transforms": [{"type": "drop_col", "config": {"columns": ["transaction_id"]}}], "depends_on": []}, {"task_id": "task_3287", "output_name": "2", "transforms": [{"type": "drop_col", "config": {"columns": ["customerid"]}}], "depends_on": []}]')
 BACKEND_URL = "http://backend:8000"
 
 default_args = {"owner": "etlflow", "retries": 0}
@@ -143,8 +143,9 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     num_partitions = max(1, min(8, row_count // 100000))
 
     df = spark.read.jdbc(
-        url=jdbc_url, table=f"(SELECT * FROM {input_table}) AS t",
-        numPartitions=num_partitions, properties=jdbc_props
+        url=jdbc_url,
+        table=f"(SELECT * FROM {input_table}) AS t",
+        properties=jdbc_props,
     )
 
     # Apply transforms
@@ -159,11 +160,15 @@ def run_with_spark(pg, input_table, output_name, transforms, row_count, spark_cf
     # Cache if multiple operations needed
     if len(transforms) > 3:
         df.cache()
-
+    
+    jdbc_url_warehouse = (
+        "jdbc:postgresql://postgres:5432/airflow"
+        f"?currentSchema=warehouse"
+    )
     # Write to warehouse via JDBC
     df.write.jdbc(
-        url=jdbc_url,
-        table=f"warehouse.{output_name}",
+        url=jdbc_url_warehouse,
+        table=f'"{output_name}"',   # nama tabel saja, tanpa skema
         mode="overwrite",
         properties=jdbc_props
     )
@@ -373,12 +378,12 @@ def run_with_postgres(pg, input_table, output_name, transforms, task_id, row_cou
 
 
 with DAG(
-    dag_id='lada',
+    dag_id='try6',
     default_args=default_args,
     schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["etl", "spark", "generated", 'wf_1779334900081'],
+    tags=["etl", "spark", "generated", 'wf_1779779554153_aaej'],
     description='',
 ) as dag:
     airflow_tasks = {}
