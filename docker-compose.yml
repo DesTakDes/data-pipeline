@@ -72,6 +72,9 @@ services:
       airflow users create --username admin --password admin
       --firstname Admin --lastname User --role Admin
       --email admin@example.com'
+      airflow pools set spark_heavy_pool 2 "Heavy Spark tasks: group_agg, join, pyspark" &&
+      airflow pools set spark_light_pool 6 "Light Spark tasks: filter, select, rename" &&
+      airflow pools set default_pool 8 "Default pool"
     restart: 'no'
 
   # ── Airflow Webserver ────────────────────────────────────────────────────────
