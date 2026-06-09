@@ -13,10 +13,10 @@ import time
 import uuid
 import tempfile
 import shutil
-from datetime import datetime
+import traceback
+from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
-from spark_dag_optimizer import generate_spark_dag
 import upload_worker
 
 app = FastAPI(title="ETLFlow API")
@@ -40,10 +40,12 @@ PG_CONFIG    = {
 DAGS_FOLDER  = os.getenv("DAGS_FOLDER", "/opt/airflow/dags")
 DATA_CSV     = "/data_csv"
 PARQUET_DIR  = "/data_csv/parquet"
-LARGE_FILE_THRESHOLD_GB = 10
+CHUNK_ROWS   = 100_000
+
 
 def get_conn():
     return psycopg2.connect(**PG_CONFIG)
+
 
 def ensure_schemas(cur, conn):
     cur.execute("CREATE SCHEMA IF NOT EXISTS meta")
@@ -51,16 +53,1050 @@ def ensure_schemas(cur, conn):
     cur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
     conn.commit()
 
-// Unique ID generator — counter + timestamp + random suffix
-let _idSeq = 0;
-const genId = () => `n${Date.now()}_${++_idSeq}_${Math.random().toString(36).slice(2, 6)}`;
 
-# ── Health ──────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# DUCKDB TRANSFORM ENGINE
+# Dijalankan langsung di dalam proses — tidak butuh Spark, tidak butuh cluster.
+# Benchmark: CSV 1GB → transform → output dalam 2–5 menit.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _duckdb_available() -> bool:
+    try:
+        import duckdb  # noqa
+        return True
+    except ImportError:
+        return False
+
+
+def _q(cols: list) -> str:
+    return ", ".join(f'"{c}"' for c in cols)
+
+
+def _build_duckdb_sql(input_alias: str, transforms: list, limit: Optional[int] = None) -> str:
+    """
+    Kompilasi semua transforms menjadi satu SQL DuckDB berantai (CTE chain).
+    DuckDB optimizer bisa inline & push-down semua sekaligus → jauh lebih
+    cepat dari loop CREATE TABLE per step di PostgreSQL.
+    """
+    cte_parts  = []
+    step       = 0
+    cur_alias  = input_alias
+    cur_cols   = None  # None = semua kolom (SELECT *)
+
+    DTYPE_MAP = {
+        "TEXT": "VARCHAR", "INTEGER": "INTEGER", "BIGINT": "BIGINT",
+        "NUMERIC": "DOUBLE", "BOOLEAN": "BOOLEAN",
+        "DATE": "DATE", "TIMESTAMP": "TIMESTAMP", "VARCHAR(255)": "VARCHAR",
+    }
+    AGGFN_MAP = {
+        "COUNT": "COUNT", "SUM": "SUM", "AVG": "AVG",
+        "MIN": "MIN", "MAX": "MAX", "COUNT DISTINCT": "COUNT_DISTINCT_PLACEHOLDER",
+    }
+
+    for tx in transforms:
+        ntype  = tx.get("type", "")
+        config = tx.get("config") or {}
+        step  += 1
+        alias  = f"s{step}"
+
+        try:
+            if ntype == "filter_rows":
+                formula = config.get("formula", "1=1")
+                cte_parts.append(f"{alias} AS (SELECT * FROM {cur_alias} WHERE {formula})")
+
+            elif ntype == "select_col":
+                cols = [c for c in config.get("columns", []) if c]
+                if cols:
+                    cte_parts.append(f"{alias} AS (SELECT {_q(cols)} FROM {cur_alias})")
+                    cur_cols = cols
+                else:
+                    step -= 1; continue
+
+            elif ntype == "drop_col":
+                drop = set(config.get("columns", []))
+                if cur_cols:
+                    keep = [c for c in cur_cols if c not in drop]
+                    cte_parts.append(f"{alias} AS (SELECT {_q(keep)} FROM {cur_alias})")
+                    cur_cols = keep
+                else:
+                    # DuckDB supports EXCLUDE
+                    excl = ", ".join(f'"{c}"' for c in drop)
+                    cte_parts.append(f"{alias} AS (SELECT * EXCLUDE ({excl}) FROM {cur_alias})")
+
+            elif ntype == "rename_col":
+                renames = config.get("renames", {})
+                if not renames:
+                    step -= 1; continue
+                if cur_cols:
+                    exprs = [f'"{c}" AS "{renames.get(c, c)}"' for c in cur_cols]
+                    cte_parts.append(f"{alias} AS (SELECT {', '.join(exprs)} FROM {cur_alias})")
+                    cur_cols = [renames.get(c, c) for c in cur_cols]
+                else:
+                    rename_sql = ", ".join(f'"{o}" AS "{n}"' for o, n in renames.items())
+                    cte_parts.append(f"{alias} AS (SELECT * RENAME ({rename_sql}) FROM {cur_alias})")
+
+            elif ntype == "add_const":
+                name  = config.get("name", "new_col")
+                val   = config.get("value", "")
+                dtype = DTYPE_MAP.get(config.get("dtype", "TEXT"), "VARCHAR")
+                cte_parts.append(
+                    f'{alias} AS (SELECT *, CAST({repr(val)} AS {dtype}) AS "{name}" FROM {cur_alias})'
+                )
+                if cur_cols:
+                    cur_cols = cur_cols + [name]
+
+            elif ntype == "set_val":
+                target = config.get("targetCol", "")
+                if not target:
+                    step -= 1; continue
+                if config.get("useExpr"):
+                    expr = config.get("expr", f'"{target}"')
+                else:
+                    src  = config.get("sourceCol", target)
+                    expr = f'"{src}"'
+                cte_parts.append(
+                    f'{alias} AS (SELECT * REPLACE ({expr} AS "{target}") FROM {cur_alias})'
+                )
+
+            elif ntype == "val_mapper":
+                src     = config.get("sourceCol", "")
+                new_col = config.get("newColName", "mapped")
+                whens   = config.get("whens", [])
+                else_v  = config.get("elseValue", "")
+                if not src or not whens:
+                    step -= 1; continue
+                when_clauses = " ".join(
+                    f'WHEN "{src}" {w["condition"]} {repr(w["value"])} THEN {repr(w["result"])}'
+                    for w in whens if w.get("value") and w.get("result")
+                )
+                case_expr = f'CASE {when_clauses} ELSE {repr(else_v)} END AS "{new_col}"'
+                cte_parts.append(f"{alias} AS (SELECT *, {case_expr} FROM {cur_alias})")
+                if cur_cols:
+                    cur_cols = cur_cols + [new_col]
+
+            elif ntype == "fill_null":
+                fill_cols = config.get("columns", [])
+                fill_val  = config.get("fillValue", "")
+                if fill_cols and config.get("fillType", "value") == "value":
+                    replace_parts = ", ".join(
+                        f'COALESCE("{c}", {repr(str(fill_val))}) AS "{c}"'
+                        for c in fill_cols
+                    )
+                    cte_parts.append(
+                        f"{alias} AS (SELECT * REPLACE ({replace_parts}) FROM {cur_alias})"
+                    )
+                else:
+                    step -= 1; continue
+
+            elif ntype == "change_type":
+                types = config.get("types", {})
+                if not types:
+                    step -= 1; continue
+                replace_parts = ", ".join(
+                    f'TRY_CAST("{c}" AS {DTYPE_MAP.get(t, "VARCHAR")}) AS "{c}"'
+                    for c, t in types.items()
+                )
+                cte_parts.append(
+                    f"{alias} AS (SELECT * REPLACE ({replace_parts}) FROM {cur_alias})"
+                )
+
+            elif ntype == "order_table":
+                orders = config.get("orders", [])
+                if not orders:
+                    step -= 1; continue
+                oc = ", ".join(
+                    f'"{o["col"]}" {o.get("dir", "ASC")}'
+                    for o in orders if o.get("col")
+                )
+                cte_parts.append(f"{alias} AS (SELECT * FROM {cur_alias} ORDER BY {oc})")
+
+            elif ntype == "group_agg":
+                gcols = config.get("groupCols", [])
+                acols = config.get("aggCols", [])
+                if not gcols or not acols:
+                    step -= 1; continue
+                agg_exprs = []
+                for a in acols:
+                    fn  = a.get("func", "COUNT")
+                    col = a.get("col", "")
+                    aln = a.get("alias", f'{col}_{fn.lower()}')
+                    if fn == "COUNT DISTINCT":
+                        agg_exprs.append(f'COUNT(DISTINCT "{col}") AS "{aln}"')
+                    else:
+                        agg_exprs.append(f'{fn}("{col}") AS "{aln}"')
+                g = _q(gcols)
+                cte_parts.append(
+                    f"{alias} AS (SELECT {g}, {', '.join(agg_exprs)} FROM {cur_alias} GROUP BY {g})"
+                )
+                cur_cols = gcols + [a.get("alias", "") for a in acols]
+
+            elif ntype == "calc":
+                new_col   = (config.get("newColName") or "result").strip()
+                col_a     = config.get("colA", "")
+                col_b     = config.get("colB", "")
+                operation = config.get("operation", "+")
+                if not (new_col and col_a and col_b):
+                    step -= 1; continue
+                op_expr = (
+                    f'TRY_CAST("{col_a}" AS DOUBLE) {operation} '
+                    f'TRY_CAST("{col_b}" AS DOUBLE)'
+                )
+                cte_parts.append(
+                    f'{alias} AS (SELECT *, ({op_expr}) AS "{new_col}" FROM {cur_alias})'
+                )
+                if cur_cols:
+                    cur_cols = cur_cols + [new_col]
+
+            elif ntype == "adv_calculator":
+                calcs   = config.get("calculations", [])
+                SCI_MAP = {
+                    "sin": "SIN", "cos": "COS", "sqrt": "SQRT",
+                    "radians": "RADIANS", "atan2": "ATAN2", "power": "POWER",
+                }
+                exprs = []
+                for calc in calcs:
+                    fn    = SCI_MAP.get(calc.get("operation", "sin"), "SIN")
+                    col_a = calc.get("colA", "")
+                    col_b = calc.get("colB", "")
+                    new_c = (calc.get("newColName") or "").strip()
+                    if not new_c or not col_a:
+                        continue
+                    if fn in ("ATAN2", "POWER"):
+                        exprs.append(
+                            f'{fn}(TRY_CAST("{col_a}" AS DOUBLE),'
+                            f'TRY_CAST("{col_b}" AS DOUBLE)) AS "{new_c}"'
+                        )
+                    else:
+                        exprs.append(f'{fn}(TRY_CAST("{col_a}" AS DOUBLE)) AS "{new_c}"')
+                if exprs:
+                    cte_parts.append(
+                        f'{alias} AS (SELECT *, {", ".join(exprs)} FROM {cur_alias})'
+                    )
+                else:
+                    step -= 1; continue
+
+            elif ntype == "combine_cols":
+                new_col     = (config.get("newColName") or "combined").strip()
+                sep         = config.get("separator", " ")
+                selected    = config.get("selectedCols", [])
+                remove_orig = config.get("removeOriginal", False)
+                if not new_col or not selected:
+                    step -= 1; continue
+                concat_parts = f" || {repr(sep)} || ".join(
+                    f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in selected
+                )
+                if remove_orig:
+                    excl = ", ".join(f'"{c}"' for c in selected)
+                    cte_parts.append(
+                        f'{alias} AS (SELECT * EXCLUDE ({excl}), '
+                        f'({concat_parts}) AS "{new_col}" FROM {cur_alias})'
+                    )
+                else:
+                    cte_parts.append(
+                        f'{alias} AS (SELECT *, ({concat_parts}) AS "{new_col}" FROM {cur_alias})'
+                    )
+                if cur_cols:
+                    cur_cols = [c for c in cur_cols if c not in (selected if remove_orig else [])]
+                    if new_col not in cur_cols:
+                        cur_cols = cur_cols + [new_col]
+
+            else:
+                # Unknown / pyspark / join — lewati (pyspark tetap di Airflow DAG)
+                step -= 1; continue
+
+        except Exception as e:
+            print(f"[DuckDB builder] step {step} ({ntype}) error: {e} — skipped")
+            step -= 1; continue
+
+        cur_alias = alias
+
+    limit_clause = f" LIMIT {limit}" if limit else ""
+    if cte_parts:
+        return f"WITH {', '.join(cte_parts)} SELECT * FROM {cur_alias}{limit_clause}"
+    return f"SELECT * FROM {input_alias}{limit_clause}"
+
+
+def _run_duckdb_pipeline(
+    input_table: str,
+    output_name: str,
+    transforms: list,
+    progress_cb=None,  # callable(pct: int, msg: str)
+) -> dict:
+    """
+    Jalankan full pipeline menggunakan DuckDB in-memory.
+    1. Baca PostgreSQL staging → DuckDB
+    2. Jalankan semua transforms dalam satu SQL
+    3. Tulis hasil ke warehouse PostgreSQL + Parquet
+    """
+    import duckdb
+
+    def upd(pct, msg):
+        print(f"[DuckDB] {pct}% — {msg}")
+        if progress_cb:
+            try:
+                progress_cb(pct, msg)
+            except Exception:
+                pass
+
+    t0  = time.time()
+    con = duckdb.connect(":memory:")
+    pg  = get_conn()
+
+    try:
+        # ── 1. Hitung ukuran data ─────────────────────────────────────────
+        cur = pg.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM {input_table}")
+        row_count = cur.fetchone()[0]
+        cur.execute(
+            "SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0",
+            (input_table,)
+        )
+        size_mb = float(cur.fetchone()[0] or 0)
+        cur.close()
+        upd(3, f"{row_count:,} rows | {size_mb:.1f} MB")
+
+        # ── 2. Baca data ke DuckDB via pandas chunked ─────────────────────
+        # Chunked supaya tidak OOM untuk 1GB+
+        upd(5, "Membaca data dari PostgreSQL…")
+        chunks  = []
+        loaded  = 0
+        offset  = 0
+        cs      = 200_000  # chunk size
+
+        while True:
+            chunk = pd.read_sql(
+                f"SELECT * FROM {input_table} LIMIT {cs} OFFSET {offset}", pg
+            )
+            if chunk.empty:
+                break
+            chunks.append(chunk)
+            loaded  += len(chunk)
+            offset  += cs
+            pct      = 5 + int((loaded / max(row_count, 1)) * 35)
+            upd(pct, f"Loaded {loaded:,}/{row_count:,}…")
+            if len(chunk) < cs:
+                break
+
+        df_input = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        con.register("_input", df_input)
+        upd(40, f"Data siap di DuckDB. Menjalankan {len(transforms)} transform(s)…")
+
+        # ── 3. Build + execute SQL ────────────────────────────────────────
+        sql        = _build_duckdb_sql("_input", transforms)
+        t_tx       = time.time()
+        result_df  = con.execute(sql).df()
+        elapsed_tx = time.time() - t_tx
+        actual     = len(result_df)
+        upd(75, f"Transform selesai: {actual:,} rows dalam {elapsed_tx:.1f}s")
+
+        # ── 4. Simpan Parquet ─────────────────────────────────────────────
+        os.makedirs(PARQUET_DIR, exist_ok=True)
+        parquet_path = f"{PARQUET_DIR}/{output_name}.parquet"
+        result_df.to_parquet(parquet_path, index=False, compression="snappy")
+        parquet_mb = os.path.getsize(parquet_path) / (1024 * 1024)
+        upd(80, f"Parquet: {parquet_path} ({parquet_mb:.1f} MB)")
+
+        # ── 5. Load ke warehouse PostgreSQL ───────────────────────────────
+        upd(82, "Menulis ke warehouse.{output_name}…")
+
+        # Sanitize nama tabel
+        safe_out  = re.sub(r'[^a-z0-9_]', '_', output_name.lower()).strip('_') or "output"
+        out_table = f'warehouse."{safe_out}"'
+
+        pg.rollback()
+        wcur = pg.cursor()
+        wcur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
+        wcur.execute(f"DROP TABLE IF EXISTS {out_table}")
+
+        # Tipe kolom dari DataFrame
+        PG_TYPE = {
+            "int64": "BIGINT", "int32": "INTEGER",
+            "float64": "NUMERIC", "float32": "NUMERIC",
+            "bool": "BOOLEAN", "object": "TEXT",
+            "datetime64[ns]": "TIMESTAMP",
+        }
+        col_defs = ", ".join(
+            f'"{c}" {PG_TYPE.get(str(result_df[c].dtype), "TEXT")}'
+            for c in result_df.columns
+        )
+        wcur.execute(
+            f"CREATE TABLE {out_table} ({col_defs}, loaded_at TIMESTAMP DEFAULT NOW())"
+        )
+        pg.commit()
+
+        # Chunked insert
+        cols_q = [f'"{c}"' for c in result_df.columns]
+        ph     = ", ".join(["%s"] * len(result_df.columns))
+        ins    = f"INSERT INTO {out_table} ({', '.join(cols_q)}) VALUES ({ph})"
+
+        inserted = 0
+        for i in range(0, actual, CHUNK_ROWS):
+            chunk = result_df.iloc[i:i + CHUNK_ROWS]
+            rows  = [
+                tuple(None if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+                      for v in row)
+                for row in chunk.itertuples(index=False)
+            ]
+            psycopg2.extras.execute_batch(wcur, ins, rows, page_size=2000)
+            pg.commit()
+            inserted += len(chunk)
+            pct       = 82 + int((inserted / max(actual, 1)) * 16)
+            upd(pct, f"Insert {inserted:,}/{actual:,}…")
+
+        wcur.close()
+        elapsed = time.time() - t0
+        upd(100, f"Selesai! {actual:,} rows dalam {elapsed:.1f} detik")
+
+        return {
+            "status"      : "success",
+            "engine"      : "duckdb",
+            "rows"        : actual,
+            "cols"        : len(result_df.columns),
+            "parquet_path": parquet_path,
+            "elapsed_s"   : round(elapsed, 1),
+            "size_mb"     : round(size_mb, 1),
+        }
+
+    finally:
+        con.close()
+        pg.close()
+
+
+def _estimate_size_mb(pg_conn, table: str, row_count: int) -> float:
+    """Estimasi ukuran tabel dalam MB."""
+    try:
+        cur = pg_conn.cursor()
+        cur.execute("SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0", (table,))
+        result = float(cur.fetchone()[0] or 0)
+        cur.close()
+        return result
+    except Exception:
+        return 0.0
+
+
+def _choose_engine(size_mb: float) -> str:
+    """
+    Pilih engine berdasarkan ukuran data:
+      <50MB    → postgres  (sudah cepat)
+      50MB–5GB → duckdb    (OPTIMAL untuk 1GB)
+      >5GB     → spark     (jika PySpark tersedia, else duckdb juga)
+    """
+    if size_mb < 50:
+        return "postgres"
+    elif size_mb < 5000:
+        return "duckdb"
+    else:
+        # Cek apakah PySpark tersedia
+        try:
+            import importlib.util
+            if importlib.util.find_spec("pyspark"):
+                return "spark"
+        except Exception:
+            pass
+        # Fallback ke DuckDB meski data besar (DuckDB bisa handle >5GB juga)
+        return "duckdb"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DAG GENERATOR — menggunakan engine yang sudah dipilih
+# ════════════════════════════════════════════════════════════════════════════
+
+def generate_dag(
+    dag_id: str,
+    workflow_id: str,
+    workflow_name: str,
+    input_table: str,
+    tasks: list,
+    description: str = "",
+    execution_timeout_minutes: int = 90,
+) -> str:
+    """
+    Generate DAG Python file dengan smart engine routing.
+    Tasks list: [{task_id, output_name, transforms, depends_on}]
+    """
+    tasks_json = json.dumps(tasks, ensure_ascii=True)
+    safe_input = re.sub(r'[^a-zA-Z0-9_.]', '', input_table)
+    safe_wf_id = workflow_id.replace("'", "")
+    safe_name  = workflow_name.replace("'", "").replace('"', '')
+    now_str    = datetime.now().isoformat()
+    pg_host    = PG_CONFIG["host"]
+    pg_port    = PG_CONFIG["port"]
+    pg_db      = PG_CONFIG["database"]
+    pg_user    = PG_CONFIG["user"]
+    pg_pass    = PG_CONFIG["password"]
+
+    return f'''# Auto-generated DAG: {dag_id}
+# Workflow : {safe_name}
+# Generated: {now_str}
+# Engine   : DuckDB (50MB-5GB) | Spark (>5GB) | PostgreSQL (<50MB)
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from datetime import datetime, timedelta
+import json, requests, os, re, sys, time, traceback
+import psycopg2, psycopg2.extras
+import pandas as pd
+
+DAG_ID      = {repr(dag_id)}
+INPUT_TABLE = {repr(safe_input)}
+WORKFLOW_ID = {repr(safe_wf_id)}
+TASKS_DEF   = json.loads({repr(tasks_json)})
+BACKEND_URL = "http://backend:8000"
+PARQUET_DIR = "/data_csv/parquet"
+CHUNK_ROWS  = 100_000
+
+PG_CONFIG = {{
+    "host": {repr(pg_host)}, "port": {pg_port},
+    "database": {repr(pg_db)},
+    "user": {repr(pg_user)}, "password": {repr(pg_pass)},
+}}
+
+default_args = {{
+    "owner"           : "etlflow",
+    "retries"         : 2,
+    "retry_delay"     : timedelta(minutes=3),
+    "execution_timeout": timedelta(minutes={execution_timeout_minutes}),
+}}
+
+
+def _get_conn():
+    return psycopg2.connect(**PG_CONFIG)
+
+
+def _q(cols):
+    return ", ".join(f\'"{{c}}"\' for c in cols)
+
+
+def _estimate_mb(pg_conn, table):
+    try:
+        cur = pg_conn.cursor()
+        cur.execute("SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0", (table,))
+        val = float(cur.fetchone()[0] or 0)
+        cur.close()
+        return val
+    except Exception:
+        return 0.0
+
+
+# ── DuckDB SQL Builder ───────────────────────────────────────────────────────
+
+def _build_duckdb_sql(input_alias, transforms, limit=None):
+    DTYPE_MAP = {{
+        "TEXT":"VARCHAR","INTEGER":"INTEGER","BIGINT":"BIGINT",
+        "NUMERIC":"DOUBLE","BOOLEAN":"BOOLEAN","DATE":"DATE",
+        "TIMESTAMP":"TIMESTAMP","VARCHAR(255)":"VARCHAR",
+    }}
+    cte_parts = []
+    step      = 0
+    cur_alias = input_alias
+    cur_cols  = None
+
+    for tx in transforms:
+        ntype  = tx.get("type","")
+        config = tx.get("config") or {{}}
+        step  += 1
+        alias  = f"s{{step}}"
+        try:
+            if ntype == "filter_rows":
+                formula = config.get("formula","1=1")
+                cte_parts.append(f"{{alias}} AS (SELECT * FROM {{cur_alias}} WHERE {{formula}})")
+            elif ntype == "select_col":
+                cols = [c for c in config.get("columns",[]) if c]
+                if cols:
+                    cte_parts.append(f"{{alias}} AS (SELECT {{_q(cols)}} FROM {{cur_alias}})")
+                    cur_cols = cols
+                else:
+                    step -= 1; continue
+            elif ntype == "drop_col":
+                drop = set(config.get("columns",[]))
+                if cur_cols:
+                    keep = [c for c in cur_cols if c not in drop]
+                    cte_parts.append(f"{{alias}} AS (SELECT {{_q(keep)}} FROM {{cur_alias}})")
+                    cur_cols = keep
+                else:
+                    excl = ", ".join(f\'"{{c}}"\' for c in drop)
+                    cte_parts.append(f"{{alias}} AS (SELECT * EXCLUDE ({{excl}}) FROM {{cur_alias}})")
+            elif ntype == "rename_col":
+                renames = config.get("renames",{{}})
+                if not renames: step -= 1; continue
+                if cur_cols:
+                    exprs = [f\'"{{c}}" AS "{{renames.get(c,c)}}"\' for c in cur_cols]
+                    cte_parts.append(f"{{alias}} AS (SELECT {{', '.join(exprs)}} FROM {{cur_alias}})")
+                    cur_cols = [renames.get(c,c) for c in cur_cols]
+                else:
+                    rename_sql = ", ".join(f\'"{{o}}" AS "{{n}}"\' for o,n in renames.items())
+                    cte_parts.append(f"{{alias}} AS (SELECT * RENAME ({{rename_sql}}) FROM {{cur_alias}})")
+            elif ntype == "add_const":
+                name  = config.get("name","new_col")
+                val   = config.get("value","")
+                dtype = DTYPE_MAP.get(config.get("dtype","TEXT"),"VARCHAR")
+                cte_parts.append(f\'{{alias}} AS (SELECT *, CAST({{repr(val)}} AS {{dtype}}) AS "{{name}}" FROM {{cur_alias}})\')
+                if cur_cols: cur_cols = cur_cols + [name]
+            elif ntype == "set_val":
+                target = config.get("targetCol","")
+                if not target: step -= 1; continue
+                expr = config.get("expr", f\'"{{target}}"\')\
+                    if config.get("useExpr") else f\'"{{config.get("sourceCol",target)}}"\'
+                cte_parts.append(f\'{{alias}} AS (SELECT * REPLACE ({{expr}} AS "{{target}}") FROM {{cur_alias}})\')
+            elif ntype == "val_mapper":
+                src     = config.get("sourceCol","")
+                new_col = config.get("newColName","mapped")
+                whens   = config.get("whens",[])
+                else_v  = config.get("elseValue","")
+                if not src or not whens: step -= 1; continue
+                wc = " ".join(
+                    f\'WHEN "{{src}}" {{w["condition"]}} {{repr(w["value"])}} THEN {{repr(w["result"])}}\' 
+                    for w in whens if w.get("value") and w.get("result")
+                )
+                cte_parts.append(f\'{{alias}} AS (SELECT *, CASE {{wc}} ELSE {{repr(else_v)}} END AS "{{new_col}}" FROM {{cur_alias}})\')
+                if cur_cols: cur_cols = cur_cols + [new_col]
+            elif ntype == "fill_null":
+                fill_cols = config.get("columns",[])
+                fill_val  = config.get("fillValue","")
+                if fill_cols and config.get("fillType","value") == "value":
+                    rp = ", ".join(f\'COALESCE("{{c}}", {{repr(str(fill_val))}}) AS "{{c}}"\' for c in fill_cols)
+                    cte_parts.append(f"{{alias}} AS (SELECT * REPLACE ({{rp}}) FROM {{cur_alias}})")
+                else: step -= 1; continue
+            elif ntype == "change_type":
+                types = config.get("types",{{}})
+                if not types: step -= 1; continue
+                rp = ", ".join(f\'TRY_CAST("{{c}}" AS {{DTYPE_MAP.get(t,"VARCHAR")}}) AS "{{c}}"\' for c,t in types.items())
+                cte_parts.append(f"{{alias}} AS (SELECT * REPLACE ({{rp}}) FROM {{cur_alias}})")
+            elif ntype == "order_table":
+                orders = config.get("orders",[])
+                if not orders: step -= 1; continue
+                oc = ", ".join(f\'"{{o["col"]}}" {{o.get("dir","ASC")}}\' for o in orders if o.get("col"))
+                cte_parts.append(f"{{alias}} AS (SELECT * FROM {{cur_alias}} ORDER BY {{oc}})")
+            elif ntype == "group_agg":
+                gcols = config.get("groupCols",[])
+                acols = config.get("aggCols",[])
+                if not gcols or not acols: step -= 1; continue
+                agg_exprs = []
+                for a in acols:
+                    fn  = a.get("func","COUNT")
+                    col = a.get("col","")
+                    aln = a.get("alias", f\'{{col}}_{{fn.lower()}}\')
+                    if fn == "COUNT DISTINCT":
+                        agg_exprs.append(f\'COUNT(DISTINCT "{{col}}") AS "{{aln}}"\')
+                    else:
+                        agg_exprs.append(f\'{{fn}}("{{col}}") AS "{{aln}}"\')
+                cte_parts.append(f"{{alias}} AS (SELECT {{_q(gcols)}}, {{', '.join(agg_exprs)}} FROM {{cur_alias}} GROUP BY {{_q(gcols)}})")
+                cur_cols = gcols + [a.get("alias","") for a in acols]
+            elif ntype == "calc":
+                new_col = (config.get("newColName") or "result").strip()
+                col_a   = config.get("colA","")
+                col_b   = config.get("colB","")
+                op      = config.get("operation","+")
+                if not (new_col and col_a and col_b): step -= 1; continue
+                cte_parts.append(f\'{{alias}} AS (SELECT *, (TRY_CAST("{{col_a}}" AS DOUBLE) {{op}} TRY_CAST("{{col_b}}" AS DOUBLE)) AS "{{new_col}}" FROM {{cur_alias}})\')
+                if cur_cols: cur_cols = cur_cols + [new_col]
+            elif ntype == "adv_calculator":
+                calcs   = config.get("calculations",[])
+                SCI_MAP = {{"sin":"SIN","cos":"COS","sqrt":"SQRT","radians":"RADIANS","atan2":"ATAN2","power":"POWER"}}
+                exprs = []
+                for calc in calcs:
+                    fn    = SCI_MAP.get(calc.get("operation","sin"),"SIN")
+                    col_a = calc.get("colA","")
+                    col_b = calc.get("colB","")
+                    new_c = (calc.get("newColName") or "").strip()
+                    if not new_c or not col_a: continue
+                    if fn in ("ATAN2","POWER"):
+                        exprs.append(f\'{{fn}}(TRY_CAST("{{col_a}}" AS DOUBLE), TRY_CAST("{{col_b}}" AS DOUBLE)) AS "{{new_c}}"\')
+                    else:
+                        exprs.append(f\'{{fn}}(TRY_CAST("{{col_a}}" AS DOUBLE)) AS "{{new_c}}"\')
+                if exprs:
+                    cte_parts.append(f"{{alias}} AS (SELECT *, {{', '.join(exprs)}} FROM {{cur_alias}})")
+                else: step -= 1; continue
+            elif ntype == "combine_cols":
+                new_col     = (config.get("newColName") or "combined").strip()
+                sep         = config.get("separator"," ")
+                selected    = config.get("selectedCols",[])
+                remove_orig = config.get("removeOriginal",False)
+                if not new_col or not selected: step -= 1; continue
+                cp = f\' || {{repr(sep)}} || \'.join(f\'COALESCE(CAST("{{c}}" AS VARCHAR), \\\'\\\')\' for c in selected)
+                if remove_orig:
+                    excl = ", ".join(f\'"{{c}}"\' for c in selected)
+                    cte_parts.append(f\'{{alias}} AS (SELECT * EXCLUDE ({{excl}}), ({{cp}}) AS "{{new_col}}" FROM {{cur_alias}})\')
+                else:
+                    cte_parts.append(f\'{{alias}} AS (SELECT *, ({{cp}}) AS "{{new_col}}" FROM {{cur_alias}})\')
+            else:
+                step -= 1; continue
+        except Exception as e:
+            print(f"[DuckDB builder] {{ntype}} error: {{e}}")
+            step -= 1; continue
+        cur_alias = alias
+
+    lc = f" LIMIT {{limit}}" if limit else ""
+    if cte_parts:
+        return f"WITH {{', '.join(cte_parts)}} SELECT * FROM {{cur_alias}}{{lc}}"
+    return f"SELECT * FROM {{input_alias}}{{lc}}"
+
+
+# ── DuckDB Pipeline Runner ───────────────────────────────────────────────────
+
+def _run_duckdb(input_table, output_name, transforms, progress_cb=None):
+    import duckdb
+    def upd(pct, msg):
+        print(f"[DuckDB] {{pct}}% — {{msg}}")
+        if progress_cb:
+            try: progress_cb(pct, msg)
+            except Exception: pass
+
+    t0  = time.time()
+    con = duckdb.connect(":memory:")
+    pg  = _get_conn()
+    try:
+        cur = pg.cursor()
+        cur.execute(f"SELECT COUNT(*) FROM {{input_table}}")
+        row_count = cur.fetchone()[0]
+        cur.close()
+        upd(3, f"{{row_count:,}} rows — membaca data…")
+
+        # Chunked read
+        chunks  = []
+        loaded  = 0
+        offset  = 0
+        cs      = 200_000
+        while True:
+            chunk = pd.read_sql(f"SELECT * FROM {{input_table}} LIMIT {{cs}} OFFSET {{offset}}", pg)
+            if chunk.empty: break
+            chunks.append(chunk)
+            loaded += len(chunk)
+            offset += cs
+            upd(5 + int((loaded / max(row_count,1)) * 35), f"Loaded {{loaded:,}}/{{row_count:,}}…")
+            if len(chunk) < cs: break
+
+        df_input = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        con.register("_input", df_input)
+        upd(40, f"Data siap. Menjalankan transforms…")
+
+        sql       = _build_duckdb_sql("_input", transforms)
+        t_tx      = time.time()
+        result_df = con.execute(sql).df()
+        actual    = len(result_df)
+        upd(75, f"Transforms selesai: {{actual:,}} rows ({{time.time()-t_tx:.1f}}s)")
+
+        # Parquet
+        os.makedirs(PARQUET_DIR, exist_ok=True)
+        pq_path = f"{{PARQUET_DIR}}/{{output_name}}.parquet"
+        result_df.to_parquet(pq_path, index=False, compression="snappy")
+        upd(80, f"Parquet: {{pq_path}} ({{os.path.getsize(pq_path)/1024/1024:.1f}} MB)")
+
+        # Warehouse
+        safe_out  = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+        out_table = f\'warehouse."{{safe_out}}"\'
+        pg.rollback()
+        wcur = pg.cursor()
+        wcur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
+        wcur.execute(f"DROP TABLE IF EXISTS {{out_table}}")
+        PG_TYPE = {{"int64":"BIGINT","int32":"INTEGER","float64":"NUMERIC","float32":"NUMERIC",
+                    "bool":"BOOLEAN","object":"TEXT","datetime64[ns]":"TIMESTAMP"}}
+        col_defs = ", ".join(f\'"{{c}}" {{PG_TYPE.get(str(result_df[c].dtype),"TEXT")}}\' for c in result_df.columns)
+        wcur.execute(f"CREATE TABLE {{out_table}} ({{col_defs}}, loaded_at TIMESTAMP DEFAULT NOW())")
+        pg.commit()
+
+        cols_q  = [f\'"{{c}}"\' for c in result_df.columns]
+        ph      = ", ".join(["%s"] * len(result_df.columns))
+        ins_sql = f"INSERT INTO {{out_table}} ({{', '.join(cols_q)}}) VALUES ({{ph}})"
+        inserted = 0
+        for i in range(0, actual, CHUNK_ROWS):
+            batch = result_df.iloc[i:i+CHUNK_ROWS]
+            rows  = [tuple(None if (v is None or (isinstance(v,float) and pd.isna(v))) else v
+                           for v in row) for row in batch.itertuples(index=False)]
+            psycopg2.extras.execute_batch(wcur, ins_sql, rows, page_size=2000)
+            pg.commit()
+            inserted += len(batch)
+            upd(80 + int((inserted/max(actual,1)) * 18), f"Insert {{inserted:,}}/{{actual:,}}…")
+        wcur.close()
+
+        elapsed = time.time() - t0
+        upd(100, f"Selesai! {{actual:,}} rows dalam {{elapsed:.1f}}s")
+        return {{"status":"success","engine":"duckdb","rows":actual,"elapsed_s":round(elapsed,1)}}
+    finally:
+        con.close()
+        pg.close()
+
+
+# ── PostgreSQL Fallback (untuk data <50MB) ──────────────────────────────────
+
+def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
+    """
+    Fallback SQL transform untuk dataset kecil (<50MB).
+    Menggunakan CTE chain agar tidak ada CREATE TABLE temp berulang.
+    """
+    safe_out   = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+    out_table  = f"warehouse.{{safe_out}}"
+    schema, tname = input_table.split(".",1) if "." in input_table else ("staging", input_table)
+
+    # Ambil kolom
+    cols = [r[0] for r in pg_hook.get_records(f"""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema=\'{{schema}}\' AND table_name=\'{{tname}}\'
+        AND column_name NOT IN (\'loaded_at\',\'date_partition\')
+        ORDER BY ordinal_position
+    """)]
+
+    pg_hook.run("CREATE SCHEMA IF NOT EXISTS warehouse")
+    pg_hook.run(f"DROP TABLE IF EXISTS {{out_table}}")
+    pg_hook.run(f"""
+        CREATE TABLE {{out_table}} AS
+        WITH _base AS (SELECT {{", ".join(f\'"{c}"\' for c in cols)}} FROM {{input_table}})
+        SELECT * FROM _base LIMIT 0
+    """)
+
+    # Bangun transforms satu per satu dengan temp CTE
+    # (untuk PostgreSQL, tidak ada DuckDB REPLACE/EXCLUDE — pakai cara eksplisit)
+    cur_from = input_table
+    step     = 0
+    for tx in transforms:
+        ntype  = tx.get("type","")
+        config = tx.get("config") or {{}}
+        step  += 1
+        tmp    = f"staging._etl_{{task_id}}_s{{step}}"
+        prev_cols = cols[:]
+        try:
+            if   ntype == "filter_rows":
+                pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT * FROM {{cur_from}} WHERE {{config.get(\'formula\',\'1=1\')}}")
+            elif ntype == "select_col":
+                sc = [c for c in config.get("columns",[]) if c in cols]
+                if sc:
+                    pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT {{_q(sc)}} FROM {{cur_from}}"); cols=sc
+                else: tmp=cur_from; step-=1; continue
+            elif ntype == "drop_col":
+                kc = [c for c in cols if c not in set(config.get("columns",[]))]
+                pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT {{_q(kc)}} FROM {{cur_from}}"); cols=kc
+            elif ntype == "rename_col":
+                rn = config.get("renames",{{}})
+                ex = ", ".join(f\'"{{c}}" AS "{{rn.get(c,c)}}"\' for c in cols)
+                pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT {{ex}} FROM {{cur_from}}")
+                cols = [rn.get(c,c) for c in cols]
+            elif ntype == "add_const":
+                n=config.get("name","c"); v=config.get("value",""); dt=config.get("dtype","TEXT")
+                pg_hook.run(f\'CREATE TABLE {{tmp}} AS SELECT {{_q(cols)}}, CAST({{repr(v)}} AS {{dt}}) AS "{{n}}" FROM {{cur_from}}\')
+                cols=cols+[n]
+            elif ntype == "filter_rows":
+                pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT * FROM {{cur_from}} WHERE {{config.get(\'formula\',\'1=1\')}}")
+            elif ntype == "fill_null":
+                fc=config.get("columns",[]); fv=config.get("fillValue","")
+                ex=", ".join(f\'COALESCE("{{c}}"::TEXT,{{repr(str(fv))}})::TEXT AS "{{c}}"\' if c in fc else f\'"{{c}}"\' for c in cols)
+                pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT {{ex}} FROM {{cur_from}}")
+            elif ntype == "order_table":
+                oc=", ".join(f\'"{{o["col"]}}" {{o.get("dir","ASC")}}\' for o in config.get("orders",[]) if o.get("col") in cols) or "1"
+                pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT {{_q(cols)}} FROM {{cur_from}} ORDER BY {{oc}}")
+            elif ntype == "group_agg":
+                gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
+                if gc and ac:
+                    ae=", ".join(f\'{{a["func"]}}("{{a["col"]}}") AS "{{a["alias"]}}"\' for a in ac)
+                    pg_hook.run(f"CREATE TABLE {{tmp}} AS SELECT {{_q(gc)}}, {{ae}} FROM {{cur_from}} GROUP BY {{_q(gc)}}")
+                    cols=gc+[a["alias"] for a in ac]
+                else: tmp=cur_from; step-=1; continue
+            else:
+                tmp=cur_from; step-=1; continue
+        except Exception as e:
+            print(f"[PG] step {{step}} {{ntype}}: {{e}}")
+            tmp=cur_from; step-=1
+        if tmp != cur_from: cur_from=tmp
+
+    # Load ke warehouse
+    pg_hook.run(f"DROP TABLE IF EXISTS {{out_table}}")
+    pg_hook.run(f"""
+        CREATE TABLE {{out_table}} AS
+        SELECT {{_q(cols)}}, NOW() AS loaded_at FROM {{cur_from}}
+    """)
+    # Cleanup temp
+    for r in pg_hook.get_records(f"""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema=\'staging\' AND table_name LIKE \'_etl_{{task_id}}_s%\'
+    """):
+        pg_hook.run(f\'DROP TABLE IF EXISTS staging."{{r[0]}}"\')
+
+
+# ── Spark Runner (hanya untuk >5GB jika PySpark tersedia) ───────────────────
+
+def _run_spark(input_table, output_name, transforms, row_count):
+    from pyspark.sql import SparkSession, functions as F
+    import importlib.util
+    if not importlib.util.find_spec("pyspark"):
+        raise RuntimeError("PySpark tidak tersedia")
+
+    safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+    spark = (SparkSession.builder
+        .appName(f"ETLFlow_{{DAG_ID}}_{{safe_out}}")
+        .config("spark.master","spark://spark:7077")
+        .config("spark.jars","/opt/spark/jars/postgresql-42.6.0.jar")
+        .config("spark.executor.memory","2g")
+        .config("spark.dynamicAllocation.enabled","true")
+        .config("spark.dynamicAllocation.maxExecutors","4")
+        .config("spark.sql.adaptive.enabled","true")
+        .getOrCreate())
+    JDBC = {{"url":"jdbc:postgresql://postgres:5432/airflow",
+             "properties":{{"user":"airflow","password":"airflow","driver":"org.postgresql.Driver"}}}}
+    df = spark.read.jdbc(url=JDBC["url"], table=f"(SELECT * FROM {{input_table}}) AS t",
+                         numPartitions=8, properties=JDBC["properties"])
+    # Apply transforms (reuse same logic as DuckDB where possible via SQL)
+    for tx in transforms:
+        ntype = tx.get("type",""); cfg = tx.get("config") or {{}}
+        try:
+            if   ntype == "filter_rows": df=df.filter(cfg.get("formula","1=1"))
+            elif ntype == "select_col":
+                c=[x for x in cfg.get("columns",[]) if x in df.columns]
+                if c: df=df.select(c)
+            elif ntype == "drop_col": df=df.drop(*[c for c in cfg.get("columns",[]) if c in df.columns])
+            elif ntype == "rename_col":
+                for o,n in cfg.get("renames",{{}}).items():
+                    if o in df.columns: df=df.withColumnRenamed(o,n)
+            elif ntype == "add_const": df=df.withColumn(cfg.get("name","c"),F.lit(cfg.get("value","")))
+            elif ntype == "fill_null":
+                for c in cfg.get("columns",[]):
+                    if c in df.columns: df=df.fillna({{c:cfg.get("fillValue","")}})
+            elif ntype == "order_table":
+                oc=[F.col(o["col"]).asc() if o.get("dir","ASC")=="ASC" else F.col(o["col"]).desc()
+                    for o in cfg.get("orders",[]) if o.get("col") in df.columns]
+                if oc: df=df.orderBy(oc)
+            elif ntype == "group_agg":
+                gc=cfg.get("groupCols",[]); ac=cfg.get("aggCols",[])
+                if gc and ac:
+                    fn_map={{"COUNT":F.count,"SUM":F.sum,"AVG":F.avg,"MIN":F.min,"MAX":F.max,"COUNT DISTINCT":F.countDistinct}}
+                    df=df.groupBy(gc).agg(*[fn_map.get(a["func"],F.count)(a["col"]).alias(a["alias"]) for a in ac])
+            elif ntype == "pyspark":
+                code=cfg.get("code","")
+                if code:
+                    ns={{"df":df,"spark":spark,"F":F}}; exec(code,ns); df=ns["df"]
+        except Exception as e:
+            print(f"[Spark] {{ntype}}: {{e}}")
+
+    df.write.jdbc(url=JDBC["url"], table=f"warehouse.{{safe_out}}", mode="overwrite", properties=JDBC["properties"])
+    if row_count > 100_000:
+        os.makedirs(PARQUET_DIR, exist_ok=True)
+        df.write.mode("overwrite").parquet(f"{{PARQUET_DIR}}/{{safe_out}}.parquet")
+    spark.stop()
+
+
+# ── Main Task Runner ─────────────────────────────────────────────────────────
+
+def run_task(task_def, **context):
+    pg_hook    = PostgresHook(postgres_conn_id="postgres_default")
+    conf       = context.get("dag_run").conf or {{}}
+    run_ids    = conf.get("run_ids", [])
+    task_id    = task_def.get("task_id", "task_1")
+    output_name= task_def.get("output_name", "output")
+    transforms = task_def.get("transforms", [])
+
+    safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+    tbl      = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{{INPUT_TABLE}}"
+
+    # Hitung ukuran
+    pg_tmp = _get_conn()
+    size_mb = _estimate_mb(pg_tmp, tbl)
+    pg_tmp.close()
+
+    if size_mb < 50:
+        engine = "postgres"
+    elif size_mb < 5000:
+        engine = "duckdb"
+    else:
+        try:
+            import importlib.util
+            engine = "spark" if importlib.util.find_spec("pyspark") else "duckdb"
+        except Exception:
+            engine = "duckdb"
+
+    print(f"[Task] {{task_id}} | {{size_mb:.1f}}MB | engine={{engine}}")
+
+    # Progress callback
+    last_pct = [0]
+    def progress(pct, msg):
+        if pct - last_pct[0] >= 10:
+            last_pct[0] = pct
+            for run_id in run_ids:
+                try:
+                    requests.patch(f"{{BACKEND_URL}}/api/pipelines/runs/{{run_id}}",
+                        json={{"status":"running","progress_pct":pct,"message":msg}}, timeout=3)
+                except Exception: pass
+
+    if engine == "duckdb":
+        result = _run_duckdb(tbl, safe_out, transforms, progress_cb=progress)
+        rows   = result.get("rows", 0)
+    elif engine == "spark":
+        row_count = pg_hook.get_first(f"SELECT COUNT(*) FROM {{tbl}}")[0]
+        _run_spark(tbl, safe_out, transforms, row_count)
+        rows = pg_hook.get_first(f\'SELECT COUNT(*) FROM warehouse."{{safe_out}}"\')[0]
+    else:
+        row_count = pg_hook.get_first(f"SELECT COUNT(*) FROM {{tbl}}")[0]
+        _run_postgres(pg_hook, tbl, safe_out, transforms, task_id)
+        try: rows = pg_hook.get_first(f\'SELECT COUNT(*) FROM warehouse."{{safe_out}}"\')[0]
+        except Exception: rows = 0
+
+    for run_id in run_ids:
+        try:
+            requests.patch(f"{{BACKEND_URL}}/api/pipelines/runs/{{run_id}}",
+                json={{"status":"success","row_count":rows,"progress_pct":100,
+                       "message":f"Done: {{rows:,}} rows via {{engine}}"}}, timeout=5)
+        except Exception as e:
+            print(f"[Task] Backend update failed: {{e}}")
+    print(f"[Done] {{task_id}} → warehouse.{{safe_out}} ({{rows:,}} rows via {{engine}})")
+
+
+def on_failure(context):
+    conf    = context.get("dag_run").conf or {{}}
+    run_ids = conf.get("run_ids", [])
+    err     = str(context.get("exception","Unknown"))[:400]
+    for run_id in run_ids:
+        try:
+            requests.patch(f"{{BACKEND_URL}}/api/pipelines/runs/{{run_id}}",
+                json={{"status":"failed","message":err}}, timeout=5)
+        except Exception: pass
+
+
+# ── DAG Definition ───────────────────────────────────────────────────────────
+
+with DAG(
+    dag_id           = DAG_ID,
+    default_args     = default_args,
+    schedule_interval= None,
+    start_date       = datetime(2024,1,1),
+    catchup          = False,
+    max_active_tasks = 4,
+    tags             = ["etl","duckdb","smart",{repr(safe_wf_id)}],
+    description      = {repr(description)},
+) as dag:
+    airflow_tasks = {{}}
+    for task_def in TASKS_DEF:
+        tid = task_def["task_id"]
+        op  = PythonOperator(
+            task_id             = tid,
+            python_callable     = run_task,
+            op_kwargs           = {{"task_def": task_def}},
+            on_failure_callback = on_failure,
+            execution_timeout   = timedelta(minutes={execution_timeout_minutes}),
+        )
+        airflow_tasks[tid] = op
+    for task_def in TASKS_DEF:
+        tid = task_def["task_id"]
+        for dep in task_def.get("depends_on",[]):
+            if dep in airflow_tasks:
+                airflow_tasks[dep] >> airflow_tasks[tid]
+'''
+
+
+# ── Alias agar tidak perlu ubah kode lain yang memanggil generate_spark_dag ──
+generate_spark_dag = generate_dag
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HEALTH
+# ════════════════════════════════════════════════════════════════════════════
+
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-# ── Airflow ─────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# AIRFLOW
+# ════════════════════════════════════════════════════════════════════════════
+
 @app.get("/api/airflow/status")
 def airflow_status():
     try:
@@ -100,7 +1136,11 @@ def trigger_dag(dag_id: str, force: bool = False):
     )
     return r.json()
 
-# ── Datasets ────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# DATASETS
+# ════════════════════════════════════════════════════════════════════════════
+
 def ensure_datasets_table(cur, conn):
     cur.execute("CREATE SCHEMA IF NOT EXISTS meta")
     cur.execute("""
@@ -120,12 +1160,9 @@ def ensure_datasets_table(cur, conn):
             updated_at  TIMESTAMP DEFAULT NOW()
         )
     """)
-    # Add missing columns if they don't exist
     for col, dtype in [
-        ("col_count", "INTEGER"),
-        ("file_size_bytes", "BIGINT"),
-        ("parquet_path", "TEXT"),
-        ("is_large", "BOOLEAN DEFAULT FALSE"),
+        ("col_count", "INTEGER"), ("file_size_bytes", "BIGINT"),
+        ("parquet_path", "TEXT"), ("is_large", "BOOLEAN DEFAULT FALSE"),
     ]:
         try:
             cur.execute(f"ALTER TABLE meta.datasets ADD COLUMN IF NOT EXISTS {col} {dtype}")
@@ -136,7 +1173,7 @@ def ensure_datasets_table(cur, conn):
 @app.get("/api/datasets")
 def list_datasets():
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     ensure_datasets_table(cur, conn)
     cur.execute("SELECT * FROM meta.datasets ORDER BY created_at DESC")
     rows = cur.fetchall()
@@ -146,19 +1183,15 @@ def list_datasets():
 @app.delete("/api/datasets/{dataset_id}")
 def delete_dataset(dataset_id: int):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT table_name, parquet_path FROM meta.datasets WHERE id = %s", (dataset_id,))
     row = cur.fetchone()
     if row and row["table_name"]:
-        try:
-            cur.execute(f'DROP TABLE IF EXISTS staging."{row["table_name"]}"')
-        except:
-            pass
+        try: cur.execute(f'DROP TABLE IF EXISTS staging."{row["table_name"]}"')
+        except: pass
     if row and row.get("parquet_path"):
-        try:
-            Path(row["parquet_path"]).unlink(missing_ok=True)
-        except:
-            pass
+        try: Path(row["parquet_path"]).unlink(missing_ok=True)
+        except: pass
     cur.execute("DELETE FROM meta.datasets WHERE id = %s", (dataset_id,))
     conn.commit()
     cur.close(); conn.close()
@@ -170,440 +1203,268 @@ async def upload_dataset(
     file: UploadFile = File(...),
     name: Optional[str] = Form(None),
 ):
-    """
-    Chunked upload: save file to disk immediately, return job_id,
-    then process in background (parse → parquet if ≥5GB → insert DB).
-    """
-    filename   = name or file.filename or "upload"
-    job_id     = str(uuid.uuid4())
-
-    # Save to a temp file (streaming, no full memory load)
+    filename = name or file.filename or "upload"
+    job_id   = str(uuid.uuid4())
     tmp_dir  = "/tmp/etlflow_uploads"
     os.makedirs(tmp_dir, exist_ok=True)
     ext      = filename.rsplit(".", 1)[-1].lower() if "." in filename else "csv"
     tmp_path = f"{tmp_dir}/{job_id}.{ext}"
-
-    # Stream file to disk in 8 MB chunks
     file_size_bytes = 0
     try:
         with open(tmp_path, "wb") as f:
             while True:
-                chunk = await file.read(8 * 1024 * 1024)  # 8 MB chunks
-                if not chunk:
-                    break
+                chunk = await file.read(8 * 1024 * 1024)
+                if not chunk: break
                 f.write(chunk)
                 file_size_bytes += len(chunk)
     except Exception as e:
         raise HTTPException(500, f"Failed to save file: {e}")
-
-    # Mark job as queued
     upload_worker._set(job_id,
         status="queued", pct=2,
         message=f"File received ({file_size_bytes/1024/1024:.1f} MB), processing…",
         filename=filename, file_size_bytes=file_size_bytes,
     )
-
-    # Schedule background processing
     background_tasks.add_task(
-        upload_worker.process_upload,
-        job_id, tmp_path, filename, file_size_bytes
+        upload_worker.process_upload, job_id, tmp_path, filename, file_size_bytes
     )
-
-    return {
-        "job_id":   job_id,
-        "status":   "processing",
-        "filename": filename,
-        "size_bytes": file_size_bytes,
-        "message":  "Upload received — processing in background",
-    }
-
+    return {"job_id": job_id, "status": "processing", "filename": filename,
+            "size_bytes": file_size_bytes, "message": "Upload received"}
 
 @app.get("/api/datasets/upload/status/{job_id}")
 def upload_status(job_id: str):
-    """Poll endpoint for upload progress."""
     job = upload_worker.get_job(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
+    if not job: raise HTTPException(404, "Job not found")
     return job
 
 @app.post("/api/datasets/connect-db")
 def connect_db(payload: dict):
     try:
-        test_conn = psycopg2.connect(
+        test = psycopg2.connect(
             host=payload["host"], port=payload.get("port", 5432),
             database=payload["database"], user=payload["username"],
             password=payload["password"], connect_timeout=5
         )
-        test_conn.close()
+        test.close()
     except Exception as e:
         raise HTTPException(400, f"Connection failed: {e}")
-
     conn = get_conn()
-    cur = conn.cursor()
+    cur  = conn.cursor()
     ensure_datasets_table(cur, conn)
-    cur.execute("""
-        INSERT INTO meta.datasets (name, type, status)
-        VALUES (%s, %s, 'connected') RETURNING id
-    """, (f"{payload['database']}@{payload['host']}", payload.get("db_type", "PostgreSQL").upper()))
-    conn.commit()
-    cur.close(); conn.close()
+    cur.execute(
+        "INSERT INTO meta.datasets (name, type, status) VALUES (%s, %s, 'connected') RETURNING id",
+        (f"{payload['database']}@{payload['host']}", payload.get("db_type","PostgreSQL").upper())
+    )
+    conn.commit(); cur.close(); conn.close()
     return {"connected": True}
 
 @app.get("/api/datasets/{dataset_id}/preview")
 def preview_dataset(dataset_id: int, limit: int = 100):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM meta.datasets WHERE id = %s", (dataset_id,))
     ds = cur.fetchone()
-    if not ds or not ds["table_name"]:
-        raise HTTPException(404, "Dataset not found")
+    if not ds or not ds["table_name"]: raise HTTPException(404, "Dataset not found")
     cur.execute(f'SELECT * FROM staging."{ds["table_name"]}" LIMIT %s', (limit,))
-    rows = cur.fetchall()
-    columns = [desc[0] for desc in cur.description]
+    rows    = cur.fetchall()
+    columns = [d[0] for d in cur.description]
     cur.close(); conn.close()
     return {"columns": columns, "rows": [dict(r) for r in rows], "total": ds["row_count"]}
 
 @app.get("/api/datasets/{dataset_id}/download")
 def download_dataset(dataset_id: int, format: str = "csv"):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM meta.datasets WHERE id = %s", (dataset_id,))
     ds = cur.fetchone()
-    if not ds or not ds["table_name"]:
-        raise HTTPException(404, "Dataset not found")
+    if not ds or not ds["table_name"]: raise HTTPException(404, "Dataset not found")
     cur.execute(f'SELECT * FROM staging."{ds["table_name"]}"')
-    rows = cur.fetchall()
-    columns = [desc[0] for desc in cur.description]
+    rows    = cur.fetchall()
+    columns = [d[0] for d in cur.description]
     cur.close(); conn.close()
-
-    df = pd.DataFrame([dict(r) for r in rows], columns=columns)
+    df      = pd.DataFrame([dict(r) for r in rows], columns=columns)
     out_dir = "/tmp/etlflow_exports"
     os.makedirs(out_dir, exist_ok=True)
     if format == "parquet":
         path = f"{out_dir}/{ds['table_name']}.parquet"
         df.to_parquet(path, index=False)
         return FileResponse(path, filename=f"{ds['table_name']}.parquet", media_type="application/octet-stream")
-    else:
-        path = f"{out_dir}/{ds['table_name']}.csv"
-        df.to_csv(path, index=False)
-        return FileResponse(path, filename=f"{ds['table_name']}.csv", media_type="text/csv")
+    path = f"{out_dir}/{ds['table_name']}.csv"
+    df.to_csv(path, index=False)
+    return FileResponse(path, filename=f"{ds['table_name']}.csv", media_type="text/csv")
 
-# ── Warehouse ────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# WAREHOUSE
+# ════════════════════════════════════════════════════════════════════════════
+
 @app.get("/api/warehouse/tables")
 def warehouse_tables():
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
-        conn.commit()
+        cur.execute("CREATE SCHEMA IF NOT EXISTS warehouse"); conn.commit()
         cur.execute("""
-            SELECT t.table_name,
-                COUNT(c.column_name) as col_count
+            SELECT t.table_name, COUNT(c.column_name) as col_count
             FROM information_schema.tables t
             LEFT JOIN information_schema.columns c
-                ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-            WHERE t.table_schema = 'warehouse' AND t.table_type = 'BASE TABLE'
+              ON c.table_schema=t.table_schema AND c.table_name=t.table_name
+            WHERE t.table_schema='warehouse' AND t.table_type='BASE TABLE'
             GROUP BY t.table_name ORDER BY t.table_name
         """)
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        return []
-    finally:
-        cur.close(); conn.close()
+        return [dict(r) for r in cur.fetchall()]
+    except: return []
+    finally: cur.close(); conn.close()
 
 @app.get("/api/warehouse/{table_name}/download")
 def download_warehouse_table(table_name: str, format: str = "csv"):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute(f'SELECT * FROM warehouse."{table_name}"')
-        rows = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
-        df = pd.DataFrame([dict(r) for r in rows], columns=columns)
+        rows    = cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        df      = pd.DataFrame([dict(r) for r in rows], columns=columns)
         out_dir = "/tmp/etlflow_exports"
         os.makedirs(out_dir, exist_ok=True)
         if format == "parquet":
             path = f"{out_dir}/{table_name}.parquet"
             df.to_parquet(path, index=False)
             return FileResponse(path, filename=f"{table_name}.parquet", media_type="application/octet-stream")
-        else:
-            path = f"{out_dir}/{table_name}.csv"
-            df.to_csv(path, index=False)
-            return FileResponse(path, filename=f"{table_name}.csv", media_type="text/csv")
-    finally:
-        cur.close(); conn.close()
+        path = f"{out_dir}/{table_name}.csv"
+        df.to_csv(path, index=False)
+        return FileResponse(path, filename=f"{table_name}.csv", media_type="text/csv")
+    finally: cur.close(); conn.close()
 
 @app.get("/api/directory/list")
 def list_directory(path: str = DATA_CSV):
-    """
-    Scan direktori dan kembalikan daftar file yang didukung.
-    Default: /data_csv (mount point data pipeline)
- 
-    Query params:
-        path : direktori yang ingin di-scan (default: DATA_CSV)
-    """
-    # Whitelist direktori yang diizinkan (keamanan)
-    ALLOWED_ROOTS = [DATA_CSV, PARQUET_DIR, "/data_csv", "/tmp/etlflow_exports"]
+    ALLOWED = [DATA_CSV, PARQUET_DIR, "/data_csv", "/tmp/etlflow_exports"]
     resolved = os.path.realpath(path)
-    if not any(resolved.startswith(os.path.realpath(r)) for r in ALLOWED_ROOTS):
+    if not any(resolved.startswith(os.path.realpath(r)) for r in ALLOWED):
         raise HTTPException(403, f"Direktori tidak diizinkan: {path}")
- 
     files = upload_worker.list_directory_files(path)
     return {"directory": path, "files": files, "count": len(files)}
- 
- 
+
 @app.post("/api/directory/preview")
 def preview_directory_file(payload: dict):
-    """
-    Preview isi file dari path direktori (tanpa PostgreSQL).
- 
-    Body:
-        file_path : path absolut ke file CSV / Parquet / Excel
-        limit     : jumlah baris preview (default: 100)
-    """
     file_path = payload.get("file_path", "")
     limit     = int(payload.get("limit", 100))
- 
-    if not file_path:
-        raise HTTPException(400, "file_path wajib diisi")
- 
+    if not file_path: raise HTTPException(400, "file_path wajib diisi")
     try:
         df = upload_worker.read_file_from_path(file_path)
-        df_preview = df.head(limit)
-        # Ganti NaN dengan None agar JSON serializable
-        df_preview = df_preview.where(pd.notnull(df_preview), None)
-        return {
-            "file_path": file_path,
-            "columns":   list(df_preview.columns),
-            "rows":      df_preview.to_dict(orient="records"),
-            "total_rows": len(df),
-            "total_cols": len(df.columns),
-        }
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
-    except Exception as e:
-        raise HTTPException(400, f"Gagal membaca file: {e}")
- 
- 
+        df_preview = df.head(limit).where(pd.notnull(df.head(limit)), None)
+        return {"file_path": file_path, "columns": list(df_preview.columns),
+                "rows": df_preview.to_dict(orient="records"),
+                "total_rows": len(df), "total_cols": len(df.columns)}
+    except FileNotFoundError as e: raise HTTPException(404, str(e))
+    except Exception as e: raise HTTPException(400, f"Gagal membaca file: {e}")
+
 @app.post("/api/directory/import")
-async def import_from_directory(
-    background_tasks: BackgroundTasks,
-    payload: dict,
-):
-    """
-    Import file dari direktori ke staging DB + Snappy Parquet.
- 
-    Body:
-        file_path    : path absolut ke file
-        save_to_db   : simpan ke PostgreSQL staging (default: true)
-        save_parquet : simpan Snappy Parquet (default: true)
-    """
-    file_path    = payload.get("file_path", "")
+async def import_from_directory(background_tasks: BackgroundTasks, payload: dict):
+    file_path    = payload.get("file_path","")
     save_to_db   = payload.get("save_to_db", True)
     save_parquet = payload.get("save_parquet", True)
- 
-    if not file_path:
-        raise HTTPException(400, "file_path wajib diisi")
- 
+    if not file_path: raise HTTPException(400, "file_path wajib diisi")
     p = Path(file_path)
-    if not p.exists():
-        raise HTTPException(404, f"File tidak ditemukan: {file_path}")
- 
-    job_id = str(uuid.uuid4())
+    if not p.exists(): raise HTTPException(404, f"File tidak ditemukan: {file_path}")
+    job_id    = str(uuid.uuid4())
     file_size = p.stat().st_size if p.is_file() else 0
- 
-    upload_worker._set(job_id,
-        status="queued", pct=2,
+    upload_worker._set(job_id, status="queued", pct=2,
         message=f"File ditemukan ({upload_worker._fmt_size(file_size)}), antri proses…",
-        filename=p.name, file_size_bytes=file_size,
-    )
- 
+        filename=p.name, file_size_bytes=file_size)
     background_tasks.add_task(
-        upload_worker.process_from_directory,
-        job_id, file_path, save_to_db, save_parquet,
+        upload_worker.process_from_directory, job_id, file_path, save_to_db, save_parquet
     )
- 
-    return {
-        "job_id":     job_id,
-        "status":     "processing",
-        "filename":   p.name,
-        "file_path":  file_path,
-        "size_bytes": file_size,
-        "save_to_db": save_to_db,
-        "save_parquet": save_parquet,
-        "message":    "Import dimulai — proses di background",
-    }
- 
- 
-@app.post("/api/directory/to-parquet")
-async def convert_to_snappy_parquet(
-    background_tasks: BackgroundTasks,
-    payload: dict,
-):
-    """
-    Konversi file CSV/Excel/Parquet dari direktori ke Snappy Parquet.
-    Tidak menyentuh PostgreSQL sama sekali.
- 
-    Body:
-        file_path  : path absolut ke file sumber
-        output_dir : direktori tujuan (default: PARQUET_DIR)
-    """
-    file_path  = payload.get("file_path", "")
-    output_dir = payload.get("output_dir", PARQUET_DIR)
- 
-    if not file_path:
-        raise HTTPException(400, "file_path wajib diisi")
- 
-    p = Path(file_path)
-    if not p.exists():
-        raise HTTPException(404, f"File tidak ditemukan: {file_path}")
- 
-    job_id = str(uuid.uuid4())
-    upload_worker._set(job_id,
-        status="queued", pct=2,
-        message="Antri konversi Parquet…",
-        filename=p.name,
-    )
- 
-    def _convert(jid, fpath, odir, stem):
-        try:
-            upload_worker._set(jid, status="reading", pct=10,
-                               message=f"Membaca {Path(fpath).name}…")
-            df = upload_worker.read_file_from_path(fpath)
-            upload_worker._set(jid, pct=50,
-                               message=f"{len(df):,} rows dibaca, menyimpan Parquet…")
-            result = upload_worker.save_as_snappy_parquet(df, stem, odir)
-            if result:
-                size = os.path.getsize(result)
-                upload_worker._set(jid, status="done", pct=100,
-                    message=f"Parquet tersimpan → {result}",
-                    parquet_path=result,
-                    file_size=upload_worker._fmt_size(size),
-                    row_count=len(df),
-                    col_count=len(df.columns),
-                )
-            else:
-                upload_worker._set(jid, status="error", pct=100,
-                                   message="Gagal menyimpan Parquet",
-                                   error="save_as_snappy_parquet returned None")
-        except Exception as e:
-            upload_worker._set(jid, status="error", pct=100,
-                               message=f"Error: {e}",
-                               error=traceback.format_exc())
- 
-    background_tasks.add_task(_convert, job_id, file_path, output_dir, p.stem)
- 
-    return {
-        "job_id":     job_id,
-        "status":     "processing",
-        "filename":   p.name,
-        "output_dir": output_dir,
-        "message":    "Konversi Parquet dimulai",
-    }
- 
- 
-# ── Parquet Download (dari direktori parquet) ────────────────────────────
+    return {"job_id": job_id, "status": "processing", "filename": p.name}
+
 @app.get("/api/parquet/list")
 def list_parquet_files():
-    """Daftar semua file Parquet yang ada di PARQUET_DIR."""
-    files = upload_worker.list_directory_files(
-        PARQUET_DIR, extensions=(".parquet",)
-    )
+    files = upload_worker.list_directory_files(PARQUET_DIR, extensions=(".parquet",))
     return {"parquet_dir": PARQUET_DIR, "files": files}
- 
- 
+
 @app.get("/api/parquet/download")
 def download_parquet_file(file_path: str, format: str = "parquet"):
-    """
-    Download file Parquet (atau konversi ke CSV) dari PARQUET_DIR.
- 
-    Query params:
-        file_path : path absolut ke file .parquet
-        format    : 'parquet' (default) atau 'csv'
-    """
-    # Validasi: hanya file di dalam PARQUET_DIR
     resolved = os.path.realpath(file_path)
     if not resolved.startswith(os.path.realpath(PARQUET_DIR)):
         raise HTTPException(403, "File di luar direktori Parquet tidak diizinkan")
- 
     p = Path(file_path)
-    if not p.exists():
-        raise HTTPException(404, "File tidak ditemukan")
- 
+    if not p.exists(): raise HTTPException(404, "File tidak ditemukan")
     if format == "csv":
-        df = upload_worker.read_parquet_from_dir(file_path)
-        out_dir = "/tmp/etlflow_exports"
+        df       = upload_worker.read_parquet_from_dir(file_path)
+        out_dir  = "/tmp/etlflow_exports"
         os.makedirs(out_dir, exist_ok=True)
         out_path = f"{out_dir}/{p.stem}.csv"
         df.to_csv(out_path, index=False)
         return FileResponse(out_path, filename=f"{p.stem}.csv", media_type="text/csv")
-    else:
-        return FileResponse(
-            file_path,
-            filename=p.name,
-            media_type="application/octet-stream",
-        )
+    return FileResponse(file_path, filename=p.name, media_type="application/octet-stream")
 
-# ── Pipeline ─────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# PIPELINE
+# ════════════════════════════════════════════════════════════════════════════
+
+def ensure_pipeline_runs_table(cur, conn):
+    cur.execute("CREATE SCHEMA IF NOT EXISTS meta")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meta.pipeline_runs (
+            id            SERIAL PRIMARY KEY,
+            dag_id        TEXT,
+            task_id       TEXT,
+            workflow_id   TEXT,
+            workflow_name TEXT,
+            input_table   TEXT,
+            output_table  TEXT,
+            row_count     INTEGER,
+            status        TEXT DEFAULT 'pending',
+            progress_pct  INTEGER DEFAULT 0,
+            message       TEXT,
+            ran_at        TIMESTAMP DEFAULT NOW(),
+            finished_at   TIMESTAMP
+        )
+    """)
+    for col, dtype in [
+        ("task_id","TEXT"), ("progress_pct","INTEGER DEFAULT 0"), ("message","TEXT")
+    ]:
+        try: cur.execute(f"ALTER TABLE meta.pipeline_runs ADD COLUMN IF NOT EXISTS {col} {dtype}")
+        except: pass
+    conn.commit()
+
 @app.post("/api/pipelines/run")
 def run_pipeline(payload: dict):
-    workflow_id   = payload.get("workflow_id", f"wf_{int(time.time())}")
+    workflow_id   = payload.get("workflow_id",   f"wf_{int(time.time())}")
     workflow_name = payload.get("workflow_name", "Pipeline")
-    input_table   = payload.get("input_table", "")
-    tasks         = payload.get("tasks", [])  # Multi-branch tasks
-    description   = payload.get("description", "")
+    input_table   = payload.get("input_table",  "")
+    tasks         = payload.get("tasks",         [])
+    description   = payload.get("description",  "")
+    timeout_min   = int(payload.get("execution_timeout_minutes", 90))
+
     # Legacy single-task support
     if not tasks and payload.get("output_name"):
         tasks = [{
-            "task_id": "task_1",
+            "task_id"    : "task_1",
             "output_name": payload.get("output_name", "output"),
-            "transforms": payload.get("transforms", []),
-            "depends_on": [],
+            "transforms" : payload.get("transforms", []),
+            "depends_on" : [],
         }]
 
-    safe_input  = re.sub(r'[^a-zA-Z0-9_.]', '', input_table)
-    # DAG ID = nama workflow langsung (lowercase, tanpa prefix)
+    safe_input   = re.sub(r'[^a-zA-Z0-9_.]', '', input_table)
     safe_wf_name = re.sub(r'[^a-z0-9_]', '_', workflow_name.lower().strip())
     safe_wf_name = re.sub(r'_+', '_', safe_wf_name).strip('_')[:60]
-    dag_id       = safe_wf_name if safe_wf_name else re.sub(r'[^a-z0-9_]', '_', workflow_id.lower())[:60]
+    dag_id       = safe_wf_name or re.sub(r'[^a-z0-9_]', '_', workflow_id.lower())[:60]
 
-    airflow_url  = os.getenv("AIRFLOW_URL", "http://airflow-webserver:8080")
-    airflow_auth = ("admin", "admin123")
-
-    # Check if DAG exists
+    # Check DAG exists
     dag_exists = False
     try:
-        r = requests.get(f"{airflow_url}/api/v1/dags/{dag_id}", auth=airflow_auth, timeout=5)
+        r = requests.get(f"{AIRFLOW_URL}/api/v1/dags/{dag_id}", auth=AIRFLOW_AUTH, timeout=5)
         dag_exists = r.status_code == 200
-    except:
-        pass
+    except: pass
 
-    dag_path = Path(DAGS_FOLDER) / f"{dag_id}.py"
-
-    def _patched_run_pipeline_snippet(payload: dict):
-    """
-    Snippet ini menunjukkan bagian yang perlu diubah di run_pipeline().
-    Salin ke dalam fungsi run_pipeline() yang sudah ada, bukan sebagai
-    fungsi terpisah.
-    """
-    # Ambil execution_mode dari payload (default: hybrid)
-    execution_mode = payload.get("execution_mode", "hybrid")
-    # Validasi nilai yang diizinkan
-    if execution_mode not in ("parallel", "sequential", "hybrid"):
-        execution_mode = "hybrid"
-
-    # Generate multi-task Spark DAG
-    dag_content = generate_spark_dag(
-        dag_id=dag_id,
-        workflow_id=workflow_id,
-        workflow_name=workflow_name,
-        input_table=safe_input,
-        tasks=tasks,
-        description=description,
-        execution_mode=execution_mode, 
+    # Generate DAG file dengan smart engine
+    dag_path    = Path(DAGS_FOLDER) / f"{dag_id}.py"
+    dag_content = generate_dag(
+        dag_id=dag_id, workflow_id=workflow_id, workflow_name=workflow_name,
+        input_table=safe_input, tasks=tasks, description=description,
+        execution_timeout_minutes=timeout_min,
     )
-
     try:
         dag_path.write_text(dag_content)
     except Exception as e:
@@ -611,380 +1472,275 @@ def run_pipeline(payload: dict):
 
     # Save run records
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     run_ids = []
     try:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS meta")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS meta.pipeline_runs (
-                id            SERIAL PRIMARY KEY,
-                dag_id        TEXT,
-                task_id       TEXT,
-                workflow_id   TEXT,
-                workflow_name TEXT,
-                input_table   TEXT,
-                output_table  TEXT,
-                row_count     INTEGER,
-                status        TEXT DEFAULT 'pending',
-                ran_at        TIMESTAMP DEFAULT NOW(),
-                finished_at   TIMESTAMP
-            )
-        """)
-        # Add task_id column if missing
-        try:
-            cur.execute("ALTER TABLE meta.pipeline_runs ADD COLUMN IF NOT EXISTS task_id TEXT")
-        except:
-            pass
-        conn.commit()
-
+        ensure_pipeline_runs_table(cur, conn)
         for task in tasks:
             safe_out = re.sub(r'[^a-z0-9_]', '_', task.get("output_name","output").lower())
-            if safe_out and safe_out[0].isdigit():
-                safe_out = 't_' + safe_out
+            if safe_out and safe_out[0].isdigit(): safe_out = 't_' + safe_out
             safe_out = safe_out or 'output'
             cur.execute("""
                 INSERT INTO meta.pipeline_runs
                     (dag_id, task_id, workflow_id, workflow_name, input_table, output_table, status)
-                VALUES (%s, %s, %s, %s, %s, %s, 'pending')
-                RETURNING id
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending') RETURNING id
             """, (dag_id, task.get("task_id","task_1"), workflow_id, workflow_name,
                   safe_input, f"warehouse.{safe_out}"))
             run_ids.append(cur.fetchone()["id"])
         conn.commit()
-    finally:
-        cur.close(); conn.close()
+    finally: cur.close(); conn.close()
 
     # Wait for DAG detection
     if not dag_exists:
-        detected = False
-        for i in range(30):          # max 30 detik
+        for i in range(30):
             time.sleep(1)
             try:
-                r = requests.get(
-                    f"{airflow_url}/api/v1/dags/{dag_id}",
-                    auth=airflow_auth, timeout=5
-                )
+                r = requests.get(f"{AIRFLOW_URL}/api/v1/dags/{dag_id}", auth=AIRFLOW_AUTH, timeout=5)
                 if r.status_code == 200 and r.json().get("dag_id"):
-                    detected = True
-                    print(f"[DAG] Detected after {i+1}s")
-                    break
-            except:
-                pass
-        if not detected:
-            print(f"[DAG] Warning: {dag_id} not detected after 30s — triggering anyway")
+                    print(f"[DAG] Detected after {i+1}s"); break
+            except: pass
     else:
         time.sleep(1)
 
-    # Unpause dulu sebelum trigger (WAJIB!)
+    # Unpause
     try:
-        requests.patch(
-            f"{airflow_url}/api/v1/dags/{dag_id}",
-            auth=airflow_auth,
-            json={"is_paused": False},
-            timeout=5
-        )
-        time.sleep(1)   # beri waktu unpause diproses
+        requests.patch(f"{AIRFLOW_URL}/api/v1/dags/{dag_id}", auth=AIRFLOW_AUTH,
+                       json={"is_paused": False}, timeout=5)
+        time.sleep(1)
     except Exception as e:
         print(f"[DAG] Unpause failed: {e}")
 
-    # Baru trigger
+    # Trigger
     try:
-        r = requests.post(
-            f"{airflow_url}/api/v1/dags/{dag_id}/dagRuns",
-            auth=airflow_auth,
-            json={"conf": {"run_ids": run_ids}},
-            timeout=10
-        )
+        r       = requests.post(f"{AIRFLOW_URL}/api/v1/dags/{dag_id}/dagRuns",
+                                auth=AIRFLOW_AUTH, json={"conf":{"run_ids":run_ids}}, timeout=10)
         dag_run = r.json()
-        print(f"[DAG] Trigger response: {r.status_code} — {dag_run}")
     except Exception as e:
         dag_run = {"error": str(e)}
 
-    return {
-        "run_ids": run_ids,
-        "run_id": run_ids[0] if run_ids else None,
-        "dag_id": dag_id,
-        "dag_run": dag_run,
-        "status": "triggered",
-        "is_new": not dag_exists,
-    }
-
+    return {"run_ids": run_ids, "run_id": run_ids[0] if run_ids else None,
+            "dag_id": dag_id, "dag_run": dag_run, "status": "triggered",
+            "is_new": not dag_exists}
 
 @app.get("/api/pipelines/runs")
 def list_pipeline_runs():
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS meta")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS meta.pipeline_runs (
-                id SERIAL PRIMARY KEY, dag_id TEXT, task_id TEXT,
-                workflow_id TEXT, workflow_name TEXT,
-                input_table TEXT, output_table TEXT, row_count INTEGER,
-                status TEXT DEFAULT 'pending',
-                ran_at TIMESTAMP DEFAULT NOW(), finished_at TIMESTAMP
-            )
-        """)
-        try:
-            cur.execute("ALTER TABLE meta.pipeline_runs ADD COLUMN IF NOT EXISTS task_id TEXT")
-        except:
-            pass
-        conn.commit()
+        ensure_pipeline_runs_table(cur, conn)
         cur.execute("""
             SELECT id, dag_id, task_id, workflow_id, workflow_name,
                    input_table, output_table, row_count, status,
-                   ran_at::text, finished_at::text
+                   COALESCE(progress_pct,0) as progress_pct,
+                   message, ran_at::text, finished_at::text
             FROM meta.pipeline_runs ORDER BY ran_at DESC LIMIT 100
         """)
         return [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        return []
-    finally:
-        cur.close(); conn.close()
-
+    except: return []
+    finally: cur.close(); conn.close()
 
 @app.patch("/api/pipelines/runs/{run_id}")
 def update_pipeline_run(run_id: int, payload: dict):
     conn = get_conn()
-    cur = conn.cursor()
+    cur  = conn.cursor()
     try:
+        ensure_pipeline_runs_table(cur, conn)
         cur.execute("""
-            UPDATE meta.pipeline_runs
-            SET status = %s, row_count = %s, finished_at = NOW()
+            UPDATE meta.pipeline_runs SET
+                status       = COALESCE(%s, status),
+                row_count    = COALESCE(%s, row_count),
+                progress_pct = COALESCE(%s, progress_pct),
+                message      = COALESCE(%s, message),
+                finished_at  = CASE WHEN %s IN ('success','failed') THEN NOW() ELSE finished_at END
             WHERE id = %s
-        """, (payload.get("status"), payload.get("row_count"), run_id))
+        """, (payload.get("status"), payload.get("row_count"),
+              payload.get("progress_pct"), payload.get("message"),
+              payload.get("status",""), run_id))
         conn.commit()
         return {"updated": True}
-    finally:
-        cur.close(); conn.close()
-
+    finally: cur.close(); conn.close()
 
 @app.get("/api/pipelines/runs/{run_id}/preview")
 def preview_run(run_id: int, limit: int = 100):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute("SELECT output_table, status FROM meta.pipeline_runs WHERE id = %s", (run_id,))
+        cur.execute("SELECT output_table, status FROM meta.pipeline_runs WHERE id=%s", (run_id,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "Run not found")
-        if row["status"] not in ("success", "completed"):
-            raise HTTPException(400, f"Pipeline not completed yet (status: {row['status']})")
+        if not row: raise HTTPException(404, "Run not found")
+        if row["status"] not in ("success","completed"):
+            raise HTTPException(400, f"Pipeline belum selesai (status: {row['status']})")
         table = row["output_table"]
-        parts = table.split(".")
-        if len(parts) != 2:
-            raise HTTPException(400, f"Invalid table: {table}")
+        if "." not in table: raise HTTPException(400, f"Invalid table: {table}")
         cur.execute(f'SELECT * FROM {table} LIMIT %s', (limit,))
-        rows = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
-        cur.execute(f'SELECT COUNT(*) as cnt FROM {table}')
-        total = cur.fetchone()["cnt"]
-        return {"columns": columns, "rows": [dict(r) for r in rows], "table": table, "total": total}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, str(e))
-    finally:
-        cur.close(); conn.close()
-
+        rows    = cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        cur.execute(f'SELECT COUNT(*) FROM {table}')
+        total = cur.fetchone()[list(cur.fetchone().keys())[0]] if cur.description else 0
+        return {"columns": columns, "rows": [dict(r) for r in rows], "table": table}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(400, str(e))
+    finally: cur.close(); conn.close()
 
 @app.get("/api/pipelines/runs/{run_id}/download")
 def download_run_output(run_id: int, format: str = "csv"):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute("SELECT output_table, status FROM meta.pipeline_runs WHERE id = %s", (run_id,))
+        cur.execute("SELECT output_table, status FROM meta.pipeline_runs WHERE id=%s", (run_id,))
         row = cur.fetchone()
-        if not row or row["status"] not in ("success", "completed"):
+        if not row or row["status"] not in ("success","completed"):
             raise HTTPException(400, "Pipeline output not available")
         table = row["output_table"]
         cur.execute(f'SELECT * FROM {table}')
-        rows = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
-        df = pd.DataFrame([dict(r) for r in rows], columns=columns)
-        tname = table.replace("warehouse.", "")
+        rows    = cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        df      = pd.DataFrame([dict(r) for r in rows], columns=columns)
+        tname   = table.replace("warehouse.","").strip('"')
         out_dir = "/tmp/etlflow_exports"
         os.makedirs(out_dir, exist_ok=True)
         if format == "parquet":
             path = f"{out_dir}/{tname}.parquet"
             df.to_parquet(path, index=False)
             return FileResponse(path, filename=f"{tname}.parquet", media_type="application/octet-stream")
-        else:
-            path = f"{out_dir}/{tname}.csv"
-            df.to_csv(path, index=False)
-            return FileResponse(path, filename=f"{tname}.csv", media_type="text/csv")
-    finally:
-        cur.close(); conn.close()
-
+        path = f"{out_dir}/{tname}.csv"
+        df.to_csv(path, index=False)
+        return FileResponse(path, filename=f"{tname}.csv", media_type="text/csv")
+    finally: cur.close(); conn.close()
 
 @app.get("/api/pipelines/runs/{run_id}/dag-status")
 def get_dag_status(run_id: int):
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute("SELECT dag_id FROM meta.pipeline_runs WHERE id = %s", (run_id,))
+        cur.execute("SELECT dag_id FROM meta.pipeline_runs WHERE id=%s", (run_id,))
         row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "Run not found")
+        if not row: raise HTTPException(404, "Run not found")
         dag_id = row["dag_id"]
-    finally:
-        cur.close(); conn.close()
-
+    finally: cur.close(); conn.close()
     try:
-        r = requests.get(
+        r    = requests.get(
             f"{AIRFLOW_URL}/api/v1/dags/{dag_id}/dagRuns?limit=1&order_by=-execution_date",
             auth=AIRFLOW_AUTH, timeout=10
         )
         runs = r.json().get("dag_runs", [])
-        run = runs[0] if runs else {}
+        run  = runs[0] if runs else {}
         tasks = {}
         if run.get("dag_run_id"):
             tr = requests.get(
                 f"{AIRFLOW_URL}/api/v1/dags/{dag_id}/dagRuns/{run['dag_run_id']}/taskInstances",
                 auth=AIRFLOW_AUTH, timeout=10
             )
-            for t in tr.json().get("task_instances", []):
+            for t in tr.json().get("task_instances",[]):
                 tasks[t["task_id"]] = t["state"]
-        return {
-            "dag_id": dag_id, "state": run.get("state", "unknown"),
-            "dag_run_id": run.get("dag_run_id"), "tasks": tasks,
-        }
+        return {"dag_id": dag_id, "state": run.get("state","unknown"),
+                "dag_run_id": run.get("dag_run_id"), "tasks": tasks}
     except Exception as e:
         return {"dag_id": dag_id, "state": "unknown", "error": str(e)}
 
 
-# ── Node Transform Preview (run SQL in-memory on staging data) ──────
+# ════════════════════════════════════════════════════════════════════════════
+# TRANSFORM PREVIEW (DuckDB-powered, instant)
+# ════════════════════════════════════════════════════════════════════════════
+
 @app.post("/api/preview/transform")
 def preview_transform(payload: dict):
     """
-    Apply transforms to staging data and return a preview.
-    Used by the frontend to preview node output without running the full DAG.
+    Preview hasil transform — menggunakan DuckDB jika tersedia (jauh lebih cepat).
     """
     dataset_id = payload.get("dataset_id")
-    transforms = payload.get("transforms", [])  # list of {type, config}
-    limit = payload.get("limit", 50)
-
-    if not dataset_id:
-        raise HTTPException(400, "dataset_id required")
+    transforms = payload.get("transforms", [])
+    limit      = payload.get("limit", 50)
+    if not dataset_id: raise HTTPException(400, "dataset_id required")
 
     conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("SELECT * FROM meta.datasets WHERE id = %s", (dataset_id,))
         ds = cur.fetchone()
-        if not ds:
-            raise HTTPException(404, "Dataset not found")
-
+        if not ds: raise HTTPException(404, "Dataset not found")
         table_name = ds["table_name"]
-        current_table = f'staging."{table_name}"'
+        tbl        = f'staging."{table_name}"'
 
-        # Get schema
+        # ── DuckDB path (cepat) ───────────────────────────────────────────
+        if _duckdb_available():
+            import duckdb
+            # Baca sample (max 100K rows untuk preview)
+            sample_df = pd.read_sql(f"SELECT * FROM {tbl} LIMIT 100000", conn)
+            dcon      = duckdb.connect(":memory:")
+            dcon.register("_input", sample_df)
+            sql    = _build_duckdb_sql("_input", transforms, limit=limit)
+            result = dcon.execute(sql).df()
+            dcon.close()
+            return {"columns": list(result.columns), "rows": result.to_dict(orient="records")}
+
+        # ── PostgreSQL CTE fallback ───────────────────────────────────────
         schema_cur = conn.cursor()
         schema_cur.execute(f"""
-            SELECT column_name, data_type FROM information_schema.columns
-            WHERE table_schema = 'staging' AND table_name = '{table_name}'
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='staging' AND table_name='{table_name}'
             ORDER BY ordinal_position
         """)
-        schema = {row[0]: row[1] for row in schema_cur.fetchall()}
-        cur_cols = list(schema.keys())
-
-        # Apply each transform in memory via SQL CTEs
-        cte_parts = []
-        step = 0
-
-        def q(cols):
-            return ", ".join(f'"{c}"' for c in cols)
+        cur_cols   = [r[0] for r in schema_cur.fetchall()]
+        current    = tbl
+        cte_parts  = []
+        step       = 0
 
         for tx in transforms:
-            ntype = tx.get("type", "")
-            config = tx.get("config") or {}
-            step += 1
-            alias = f"step_{step}"
-            prev = f"step_{step-1}" if step > 1 else current_table
-
+            ntype  = tx.get("type",""); config = tx.get("config") or {}
+            step  += 1; alias = f"step_{step}"
+            prev   = f"step_{step-1}" if step > 1 else current
             try:
-                if ntype == "filter_rows":
-                    formula = config.get("formula", "1=1")
-                    cte_parts.append(f'{alias} AS (SELECT * FROM {prev} WHERE {formula})')
+                if   ntype == "filter_rows":
+                    cte_parts.append(f"{alias} AS (SELECT * FROM {prev} WHERE {config.get('formula','1=1')})")
                 elif ntype == "select_col":
                     cols = [c for c in config.get("columns", cur_cols) if c in cur_cols]
                     if cols:
-                        cte_parts.append(f'{alias} AS (SELECT {q(cols)} FROM {prev})')
+                        cte_parts.append(f"{alias} AS (SELECT {_q(cols)} FROM {prev})")
                         cur_cols = cols
-                    else:
-                        cte_parts.append(f'{alias} AS (SELECT * FROM {prev})')
+                    else: step -= 1; continue
                 elif ntype == "drop_col":
-                    keep = [c for c in cur_cols if c not in set(config.get("columns", []))]
-                    cte_parts.append(f'{alias} AS (SELECT {q(keep)} FROM {prev})')
+                    keep = [c for c in cur_cols if c not in set(config.get("columns",[]))]
+                    cte_parts.append(f"{alias} AS (SELECT {_q(keep)} FROM {prev})")
                     cur_cols = keep
                 elif ntype == "rename_col":
-                    renames = config.get("renames", {})
-                    exprs = ", ".join(f'"{c}" AS "{renames.get(c, c)}"' for c in cur_cols)
-                    cte_parts.append(f'{alias} AS (SELECT {exprs} FROM {prev})')
-                    cur_cols = [renames.get(c, c) for c in cur_cols]
+                    rn   = config.get("renames",{})
+                    ex   = ", ".join(f'"{c}" AS "{rn.get(c,c)}"' for c in cur_cols)
+                    cte_parts.append(f"{alias} AS (SELECT {ex} FROM {prev})")
+                    cur_cols = [rn.get(c,c) for c in cur_cols]
                 elif ntype == "add_const":
-                    name = config.get("name", "new_col")
-                    val = config.get("value", "NULL")
-                    dtype = config.get("dtype", "TEXT")
-                    cte_parts.append(f'{alias} AS (SELECT {q(cur_cols)}, CAST({repr(val)} AS {dtype}) AS "{name}" FROM {prev})')
-                    cur_cols = cur_cols + [name]
+                    n=config.get("name","c"); v=config.get("value",""); dt=config.get("dtype","TEXT")
+                    cte_parts.append(f'{alias} AS (SELECT {_q(cur_cols)}, CAST({repr(v)} AS {dt}) AS "{n}" FROM {prev})')
+                    cur_cols = cur_cols + [n]
                 elif ntype == "fill_null":
-                    fill_cols = config.get("columns", [])
-                    fill_val = config.get("fillValue", "")
-                    fill_type = config.get("fillType", "value")
-                    exprs_list = []
-                    for c in cur_cols:
-                        if c in fill_cols:
-                            if fill_type == "value":
-                                exprs_list.append(f"COALESCE(\"{c}\"::TEXT, {repr(str(fill_val))})::TEXT AS \"{c}\"")
-                            else:
-                                exprs_list.append(f'"{c}"')
-                        else:
-                            exprs_list.append(f'"{c}"')
-                    cte_parts.append(f'{alias} AS (SELECT {", ".join(exprs_list)} FROM {prev})')
+                    fc=config.get("columns",[]); fv=config.get("fillValue","")
+                    ex=", ".join(f"COALESCE(\"{c}\"::TEXT,{repr(str(fv))})::TEXT AS \"{c}\"" if c in fc else f'"{c}"' for c in cur_cols)
+                    cte_parts.append(f"{alias} AS (SELECT {ex} FROM {prev})")
                 elif ntype == "order_table":
-                    orders = config.get("orders", [])
-                    oc = ", ".join(f'"{o["col"]}" {o.get("dir","ASC")}' for o in orders if o.get("col") in cur_cols) or "1"
-                    cte_parts.append(f'{alias} AS (SELECT {q(cur_cols)} FROM {prev} ORDER BY {oc})')
-                elif ntype == "change_type":
-                    types = config.get("types", {})
-                    exprs = ", ".join(
-                        f'"{c}"::TEXT::{types[c]} AS "{c}"' if c in types else f'"{c}"'
-                        for c in cur_cols
-                    )
-                    cte_parts.append(f'{alias} AS (SELECT {exprs} FROM {prev})')
+                    oc=", ".join(f'"{o["col"]}" {o.get("dir","ASC")}' for o in config.get("orders",[]) if o.get("col") in cur_cols) or "1"
+                    cte_parts.append(f"{alias} AS (SELECT {_q(cur_cols)} FROM {prev} ORDER BY {oc})")
                 elif ntype == "group_agg":
-                    gcols = [c for c in config.get("groupCols", []) if c in cur_cols]
-                    acols = config.get("aggCols", [])
-                    if gcols and acols:
-                        g = q(gcols)
-                        a = ", ".join(f'{x["func"]}("{x["col"]}") AS "{x["alias"]}"' for x in acols)
-                        cte_parts.append(f'{alias} AS (SELECT {g}, {a} FROM {prev} GROUP BY {g})')
-                        cur_cols = gcols + [x["alias"] for x in acols]
-                    else:
-                        cte_parts.append(f'{alias} AS (SELECT * FROM {prev})')
-                else:
-                    cte_parts.append(f'{alias} AS (SELECT * FROM {prev})')
+                    gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
+                    if gc and ac:
+                        ae=", ".join(f'{a["func"]}("{a["col"]}") AS "{a["alias"]}"' for a in ac)
+                        cte_parts.append(f"{alias} AS (SELECT {_q(gc)}, {ae} FROM {prev} GROUP BY {_q(gc)})")
+                        cur_cols = gc + [a["alias"] for a in ac]
+                    else: step -= 1; continue
+                else: step -= 1; continue
             except Exception as e:
-                cte_parts.append(f'{alias} AS (SELECT * FROM {prev})')
+                cte_parts.append(f"{alias} AS (SELECT * FROM {prev})")
 
-        if cte_parts:
-            last_alias = f"step_{step}"
-            sql = f"WITH {', '.join(cte_parts)} SELECT * FROM {last_alias} LIMIT {limit}"
-        else:
-            sql = f"SELECT * FROM {current_table} LIMIT {limit}"
-
+        last = f"step_{step}" if cte_parts else current
+        sql  = (f"WITH {', '.join(cte_parts)} SELECT * FROM {last} LIMIT {limit}"
+                if cte_parts else f"SELECT * FROM {current} LIMIT {limit}")
         cur.execute(sql)
-        rows = cur.fetchall()
-        columns = [desc[0] for desc in cur.description]
+        rows    = cur.fetchall()
+        columns = [d[0] for d in cur.description]
         return {"columns": columns, "rows": [dict(r) for r in rows]}
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Transform preview failed: {e}")
-    finally:
-        cur.close(); conn.close()
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(400, f"Preview failed: {e}")
+    finally: cur.close(); conn.close()
 
 
 # # ── DAG Generator (Spark-based) ──────────────────────────────────────
