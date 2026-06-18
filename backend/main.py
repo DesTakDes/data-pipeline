@@ -1092,6 +1092,173 @@ generate_spark_dag = generate_dag
 def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
+@app.get("/api/directory/bulk-preview")
+def bulk_preview(
+    directory: str  = "/data_csv",
+    recursive: bool = False,
+):
+    """
+    Preview semua file yang akan diimport dari direktori.
+    Panggil ini sebelum bulk-import untuk lihat daftar file.
+ 
+    Response:
+    {
+        "directory": "/data_csv",
+        "total_files": 5,
+        "total_size": "4.23 GB",
+        "files": [
+            {
+                "name": "sales_2024.csv",
+                "path": "/data_csv/sales_2024.csv",
+                "size_str": "1.02 GB",
+                "ext": "csv",
+                "table_name": "sales_2024",
+                "mode": "streaming",
+                "already_imported": false
+            },
+            ...
+        ]
+    }
+    """
+    from upload_worker import scan_all_files
+ 
+    try:
+        files      = scan_all_files(directory, recursive)
+        total_size = sum(f["size_bytes"] for f in files)
+ 
+        return {
+            "directory":   directory,
+            "total_files": len(files),
+            "total_size":  upload_worker._fmt_size(total_size),
+            "files":       files,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Scan gagal: {e}")
+ 
+ 
+@app.post("/api/directory/bulk-import")
+async def bulk_import(
+    background_tasks: BackgroundTasks,
+    payload: dict,
+):
+    """
+    Import SEMUA file dari direktori sekaligus.
+ 
+    Body (semua opsional):
+    {
+        "directory"    : "/data_csv",    ← default: /data_csv
+        "recursive"    : false,          ← masuk subfolder?
+        "save_parquet" : true,           ← simpan Parquet juga?
+        "skip_existing": true,           ← lewati yg sudah ada di staging?
+        "file_filter"  : ["a.csv", "b.parquet"]  ← null = semua file
+    }
+ 
+    Response:
+    {
+        "bulk_id": "abc-123",
+        "status" : "processing",
+        "total_files": 5
+    }
+ 
+    Polling: GET /api/directory/bulk-status/{bulk_id}
+    """
+    from upload_worker import process_bulk_import, scan_all_files
+ 
+    directory     = payload.get("directory",     "/data_csv")
+    recursive     = payload.get("recursive",     False)
+    save_parquet  = payload.get("save_parquet",  True)
+    skip_existing = payload.get("skip_existing", True)
+    file_filter   = payload.get("file_filter",   None)  # list nama file / None
+ 
+    # Preview dulu untuk validasi
+    try:
+        files = scan_all_files(directory, recursive)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Direktori tidak ditemukan: {directory}")
+ 
+    if file_filter:
+        files = [f for f in files if f["name"] in file_filter]
+ 
+    if not files:
+        return {
+            "bulk_id":     None,
+            "status":      "skipped",
+            "total_files": 0,
+            "message":     "Tidak ada file yang ditemukan.",
+        }
+ 
+    bulk_id = str(uuid.uuid4())
+ 
+    background_tasks.add_task(
+        process_bulk_import,
+        bulk_id,
+        directory,
+        recursive,
+        save_parquet,
+        skip_existing,
+        file_filter,
+    )
+ 
+    total_size = sum(f["size_bytes"] for f in files)
+ 
+    return {
+        "bulk_id":     bulk_id,
+        "status":      "processing",
+        "total_files": len(files),
+        "total_size":  upload_worker._fmt_size(total_size),
+        "directory":   directory,
+        "message":     f"Import {len(files)} file dimulai di background.",
+    }
+ 
+ 
+@app.get("/api/directory/bulk-status/{bulk_id}")
+def bulk_status(bulk_id: str):
+    """
+    Polling status bulk import.
+ 
+    Response:
+    {
+        "bulk_id"     : "abc-123",
+        "status"      : "running",        ← pending|running|done|error
+        "progress_pct": 45,
+        "files_done"  : 2,
+        "files_total" : 5,
+        "message"     : "3 file selesai, 2 sedang proses…",
+        "summary"     : { ... },          ← ada setelah selesai
+        "files": {
+            "sales_2024.csv": {
+                "status" : "done",
+                "pct"    : 100,
+                "row_count": 5000000,
+                "message": "Selesai — 5,000,000 rows diimport"
+            },
+            "orders.csv": {
+                "status" : "running",
+                "pct"    : 43,
+                "message": "423,000 rows (87,000 rows/s)…"
+            },
+            ...
+        }
+    }
+    """
+    from upload_worker import get_bulk_job
+ 
+    job = get_bulk_job(bulk_id)
+    if not job:
+        raise HTTPException(404, f"Bulk job tidak ditemukan: {bulk_id}")
+ 
+    return {"bulk_id": bulk_id, **job}
+ 
+ 
+@app.delete("/api/directory/bulk-status/{bulk_id}")
+def clear_bulk_job(bulk_id: str):
+    """Hapus record bulk job dari memory (cleanup)."""
+    from upload_worker import _bulk_jobs
+ 
+    if bulk_id in _bulk_jobs:
+        del _bulk_jobs[bulk_id]
+        return {"cleared": True}
+    raise HTTPException(404, "Bulk job tidak ditemukan")
 
 # ════════════════════════════════════════════════════════════════════════════
 # AIRFLOW
@@ -1335,15 +1502,6 @@ def download_warehouse_table(table_name: str, format: str = "csv"):
         return FileResponse(path, filename=f"{table_name}.csv", media_type="text/csv")
     finally: cur.close(); conn.close()
 
-@app.get("/api/directory/list")
-def list_directory(path: str = DATA_CSV):
-    ALLOWED = [DATA_CSV, PARQUET_DIR, "/data_csv", "/tmp/etlflow_exports"]
-    resolved = os.path.realpath(path)
-    if not any(resolved.startswith(os.path.realpath(r)) for r in ALLOWED):
-        raise HTTPException(403, f"Direktori tidak diizinkan: {path}")
-    files = upload_worker.list_directory_files(path)
-    return {"directory": path, "files": files, "count": len(files)}
-
 @app.post("/api/directory/preview")
 def preview_directory_file(payload: dict):
     file_path = payload.get("file_path", "")
@@ -1357,24 +1515,6 @@ def preview_directory_file(payload: dict):
                 "total_rows": len(df), "total_cols": len(df.columns)}
     except FileNotFoundError as e: raise HTTPException(404, str(e))
     except Exception as e: raise HTTPException(400, f"Gagal membaca file: {e}")
-
-@app.post("/api/directory/import")
-async def import_from_directory(background_tasks: BackgroundTasks, payload: dict):
-    file_path    = payload.get("file_path","")
-    save_to_db   = payload.get("save_to_db", True)
-    save_parquet = payload.get("save_parquet", True)
-    if not file_path: raise HTTPException(400, "file_path wajib diisi")
-    p = Path(file_path)
-    if not p.exists(): raise HTTPException(404, f"File tidak ditemukan: {file_path}")
-    job_id    = str(uuid.uuid4())
-    file_size = p.stat().st_size if p.is_file() else 0
-    upload_worker._set(job_id, status="queued", pct=2,
-        message=f"File ditemukan ({upload_worker._fmt_size(file_size)}), antri proses…",
-        filename=p.name, file_size_bytes=file_size)
-    background_tasks.add_task(
-        upload_worker.process_from_directory, job_id, file_path, save_to_db, save_parquet
-    )
-    return {"job_id": job_id, "status": "processing", "filename": p.name}
 
 @app.get("/api/parquet/list")
 def list_parquet_files():

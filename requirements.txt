@@ -4,3 +4,4 @@ apache-airflow-providers-apache-spark
 requests
 pandas
 psycopg2-binary
+duckdb==0.10.3
