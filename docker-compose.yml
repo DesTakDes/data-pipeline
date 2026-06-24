@@ -15,19 +15,17 @@ x-airflow-common: &airflow-common
     AIRFLOW_CONN_POSTGRES_DEFAULT: 'postgresql://airflow:airflow@postgres:5432/airflow'
     JAVA_HOME: /usr/lib/jvm/default-java
     SPARK_HOME: /opt/spark
-
   volumes:
-    - ./airflow-dags:/opt/airflow/dags
+    - ./airflow-dags:/opt/airflow/dags    # bind mount
     - ./spark-jobs:/opt/airflow/spark-jobs
-    - ./data_csv:/opt/airflow/data_csv
-    - airflow_logs:/opt/airflow/logs
+    - ./data_csv:/data_csv                # ← tambahkan ini ke airflow juga
+    - airflow_logs:/opt/airflow/logs      # named volume (pakai _)
   depends_on:
     postgres:
       condition: service_healthy
 
 services:
 
-# ── FastAPI Backend ───────────────────────────────────────────
   backend:
     build:
       context: ./backend
@@ -41,16 +39,15 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       AIRFLOW_URL: http://airflow-webserver:8080
-      DAGS_FOLDER: /opt/airflow/dags 
+      DAGS_FOLDER: /opt/airflow/dags
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ./data_csv:/data_csv
-      - ./airflow-dags:/opt/airflow/dags 
+      - ./data_csv:/data_csv              # bind mount ke host folder
+      - ./airflow-dags:/opt/airflow/dags
     restart: unless-stopped
 
-  # ── PostgreSQL ───────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15
     env_file: .env
@@ -64,20 +61,24 @@ services:
       interval: 5s
       retries: 5
 
-  # ── Airflow Init ─────────────────────────────────────────────────────────────
   airflow-init:
     <<: *airflow-common
     command: >
-      bash -c 'airflow db init &&
-      airflow users create --username admin --password admin
-      --firstname Admin --lastname User --role Admin
-      --email admin@example.com'
-      airflow pools set spark_heavy_pool 2 "Heavy Spark tasks: group_agg, join, pyspark" &&
-      airflow pools set spark_light_pool 6 "Light Spark tasks: filter, select, rename" &&
+      bash -c '
+      airflow db init &&
+      airflow users create
+        --username admin
+        --password admin123
+        --firstname Admin
+        --lastname User
+        --role Admin
+        --email admin@example.com &&
+      airflow pools set spark_heavy_pool 2 "Heavy Spark tasks" &&
+      airflow pools set spark_light_pool 6 "Light Spark tasks" &&
       airflow pools set default_pool 8 "Default pool"
+      '
     restart: 'no'
 
-  # ── Airflow Webserver ────────────────────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
     command: webserver
@@ -85,13 +86,11 @@ services:
       - '8080:8080'
     restart: unless-stopped
 
-  # ── Airflow Scheduler ────────────────────────────────────────────────────────
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
     restart: unless-stopped
 
-  # ── Apache Spark Master ──────────────────────────────────────────────────────
   spark:
     image: apache/spark:3.5.3
     user: root
@@ -102,7 +101,6 @@ services:
       - '8181:8080'
       - '7077:7077'
 
-  # ── Spark Worker ─────────────────────────────────────────────────────────────
   spark-worker:
     image: apache/spark:3.5.3
     user: root
@@ -112,7 +110,6 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
     depends_on: [spark]
 
-  # ── Metabase ─────────────────────────────────────────────────────────────────
   metabase:
     image: metabase/metabase:latest
     ports:
@@ -127,10 +124,6 @@ services:
       postgres:
         condition: service_healthy
 
-  # ── Pipeline Studio (Nginx reverse proxy + frontend) ─────────────────────────
-  #   Serves the React frontend on port 5173
-  #   Proxies /airflow-api → Airflow REST API (port 8080)
-  #   Proxies /metabase    → Metabase         (port 3000)
   pipeline-studio:
     image: nginx:alpine
     ports:
@@ -145,5 +138,4 @@ services:
 
 volumes:
   postgres_data:
-  airflow_logs:
-  airflow-dags:
+  airflow_logs:    # ← pakai underscore, konsisten

@@ -410,28 +410,21 @@ export const toDagId = (name) =>
 
 // ── Workflow Editor ────────────────────────────────────────────────────────────
 function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
-    if (!workflow?.id) {
-    return (
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"center",
-        height:"100vh", color: C.g400, fontSize: 14 }}>
-        Loading workflow…
-      </div>
-    );
-  }
-  const [nodes, setNodes, onNodesChange] = useNodesState(workflow.nodes || []);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(workflow.edges || []);
-  const [wfTab, setWfTab]       = useState("datasets");
-  const [running, setRunning]   = useState(false);
-  const [dagStatus, setDagStatus] = useState(null);
-  const [taskStates, setTaskStates] = useState({});
-  const [configModal, setConfigModal] = useState(null);
-  const [utilNode, setUtilNode] = useState(null);
-  const [previewNode, setPreviewNode] = useState(null);
+  // ── ALL HOOKS MUST COME FIRST — no early returns before this block ────────
+  const [nodes, setNodes, onNodesChange] = useNodesState(workflow?.nodes || []);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(workflow?.edges || []);
+  const [wfTab, setWfTab]               = useState("datasets");
+  const [running, setRunning]           = useState(false);
+  const [dagStatus, setDagStatus]       = useState(null);
+  const [taskStates, setTaskStates]     = useState({});
+  const [configModal, setConfigModal]   = useState(null);
+  const [utilNode, setUtilNode]         = useState(null);
+  const [previewNode, setPreviewNode]   = useState(null);
   const [outputSidebarNodeId, setOutputSidebarNodeId] = useState(null);
-  const [inputConfig, setInputConfig] = useState({ datasetId: "" });
+  const [inputConfig, setInputConfig]   = useState({ datasetId: "" });
   const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "" });
   const pollRef = useRef(null);
-
+  
 // Column propagation
   const columnMap = useMemo(() => computeNodeColumns(nodes, edges), [nodes, edges]);
 

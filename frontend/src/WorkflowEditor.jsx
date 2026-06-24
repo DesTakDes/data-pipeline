@@ -8,7 +8,6 @@ import "@xyflow/react/dist/style.css";
 import { UtilityConfigModal } from "./UtilityConfigs";
 import { computeNodeColumns, getUpstreamColumns } from "./NodePropagation";
 import axios from "axios";
-import { computeNodeColumns } from "./NodePropagation"; 
 
 const api     = axios.create({ baseURL: "/api" });
 const airflow = axios.create({
@@ -106,40 +105,6 @@ const getUpstreamData = (nodeId, nodes, edges) => {
     return getUpstreamData(parentNode.id, nodes, edges);
   }
 };
-
-// 4. CUSTOM NODE COMPONENT
-function ETLNode({ id, data, selected }) {
-  const nodeDef = NODE_TYPES.find(n => n.type === data.type) || { color: C.gray };
-  const isInput  = data.type === "input_dataset";
-  const isOutput = data.type === "output_dataset";
-
-  return (
-    <div style={{
-      background: "#fff",
-      border: `2px solid ${selected ? nodeDef.color : "#E2E8F0"}`,
-      borderRadius: "8px", minWidth: "150px",
-      boxShadow: selected ? `0 0 0 4px ${nodeDef.color}22` : "0 2px 4px rgba(0,0,0,0.05)"
-    }}>
-      {!isInput && <Handle type="target" position={Position.Left} style={{ background: nodeDef.color }} />}
-      {!isOutput && <Handle type="source" position={Position.Right} style={{ background: nodeDef.color }} />}
-
-      <div style={{ background: nodeDef.color, padding: "8px", borderRadius: "5px 5px 0 0", color: "#fff", fontSize: "11px", fontWeight: "bold", textAlign: "center" }}>
-        {data.label}
-      </div>
-      <div style={{ padding: "10px", fontSize: "10px", textAlign: "center", color: C.dark }}>
-        {data.isConnected ? (
-          <span style={{ color: C.green }}>🔗 Connected</span>
-        ) : isInput ? (
-          <span>Data Source</span>
-        ) : (
-          <span style={{ color: C.red }}>⚠ Unconnected</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-const customNodeTypes = { etlNode: CustomNode };
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 const Ic = {
@@ -901,18 +866,6 @@ export default function WorkflowEditor({ datasets = [], onSave, toast }) {
     ]);
   };
 
-  const onConnect = (params) => setEdges((eds) => addEdge(params, eds));
-
-  // --- RE-EDITABLE CONFIG HANDLER ---
-  const handleConfigChange = (key, value) => {
-    setNodes((prev) =>
-      prev.map(n => n.id === selectedNodeId
-        ? { ...n, data: { ...n.data, config: { ...n.data.config, [key]: value } } }
-        : n
-      )
-    );
-  };
-
   const selectedNode = nodes.find(n => n.id === selectedNodeId);
   const upstreamCols = selectedNode?.data?.upstreamColumns || [];
 
@@ -1140,47 +1093,6 @@ export default function WorkflowEditor({ datasets = [], onSave, toast }) {
     setNodes(nds => nds.filter(n => n.id !== selectedId));
     setEdges(eds => eds.filter(e => e.source !== selectedId && e.target !== selectedId));
     setSelectedId(null);
-  };
-
-  // -- Trigger Multi-Branch Pipeline --
-  const handleRunPipeline = () => {
-    const outputs = nodes.filter(n => n.data.type === "output_dataset");
-    if (outputs.length === 0) return alert("Peringatan: Tambahkan minimal 1 Output Dataset!");
-
-    // Algoritma Membaca Graf Mundur (Multi-Branch)
-    const tasks = outputs.map(outNode => {
-      let currentId = outNode.id;
-      let transforms = [];
-      let inputConfig = null;
-
-      while (currentId) {
-        const edge = edges.find(e => e.target === currentId);
-        if (!edge) break;
-
-        const parent = nodes.find(n => n.id === edge.source);
-        if (!parent) break;
-
-        if (parent.data.type === "input_dataset") {
-          inputConfig = parent.data.config.dataset;
-          break;
-        } else {
-          // Push ke depan array agar urutannya dari Input -> Output
-          transforms.unshift({ type: parent.data.type, config: parent.data.config });
-        }
-        currentId = parent.id;
-      }
-
-      return {
-        task_id: outNode.id,
-        output_name: outNode.data.config.outputName || `table_${outNode.id}`,
-        save_format: outNode.data.config.format || "PARQUET",
-        inputs: inputConfig ? [{ name: inputConfig.name }] : [],
-        transforms: transforms
-      };
-    });
-
-    console.log("PAYLOAD JSON UNTUK SPARK:", JSON.stringify({ workflow_name: "My_DAG", tasks }, null, 2));
-    alert("Pipeline berhasi di-trigger! Cek console untuk melihat struktur JSON Multi-Branch yang dikirim ke Backend.");
   };
 
   // -- Generate Data Preview --
