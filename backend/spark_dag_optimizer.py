@@ -309,11 +309,15 @@ def build_spark_config(estimated_mb, cluster):
             "dynamic": False, "partitions": 1,
         }
     elif estimated_mb < 500:
-        mem = max(512, min(1024, int(safe_mem / workers)))
+        mem   = max(512, min(1024, int(safe_mem / workers)))
+        parts = 2
         return {
             "use_spark": True,
             "executor_memory": f"{mem}m", "executor_cores": min(2, safe_cores),
-            "num_executors": min(2, workers), "dynamic": False, "partitions": 2,
+            "num_executors": min(2, workers), "dynamic": False, "partitions": parts,
+            "extra_configs": {
+                "spark.sql.shuffle.partitions": str(parts),
+            }
         }
     elif estimated_mb < 5000:
         n_exec = max(2, min(workers, int(estimated_mb / 500)))
@@ -324,6 +328,9 @@ def build_spark_config(estimated_mb, cluster):
             "use_spark": True,
             "executor_memory": f"{mem}m", "executor_cores": cores,
             "num_executors": n_exec, "dynamic": True, "partitions": parts,
+            "extra_configs": {
+                "spark.sql.shuffle.partitions": str(parts),
+            }
         }
     else:
         mem   = max(2048, min(8192, int(safe_mem / workers)))
