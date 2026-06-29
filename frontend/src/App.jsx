@@ -120,7 +120,6 @@ const NODE_STYLE = {
   join_data:      { bg: C.blue,      text: "Join" },
   pyspark:        { bg: C.orange,    text: "Spark" },
   drop_col:       { bg: C.red,       text: "Drop" },
-  // ── New Nodes ────────────────────────────────────────────────────────────
   calc:           { bg: "#7C3AED",   text: "Calc" },    // violet
   adv_calculator: { bg: "#4338CA",   text: "SciCalc" }, // indigo
   combine_cols:   { bg: "#0D9488",   text: "Combine" }, // teal
@@ -254,20 +253,17 @@ function NodePreviewPanel({ node, datasets, edges, nodes, onClose }) {
         .catch(() => setError("Could not load preview"))
         .finally(() => setLoading(false));
     } else if (!isInput && !isOutput) {
-      // Find source dataset
       const colMap = computeNodeColumns(nodes, edges);
       const sourceEdge = edges.find(e => e.target === node.id);
       if (!sourceEdge) {
         setData({ columns: [], rows: [], info: "Connect to upstream node first" });
         return;
       }
-      // Trace back to input dataset
       const inputNode = nodes.find(n => n.data?.type === "input_dataset" && n.data?.config?.dataset?.id);
       if (!inputNode) {
         setData({ columns: colMap[node.id] || [], rows: [], info: "No input dataset connected" });
         return;
       }
-      // Build transform chain up to this node
       const chain = buildTransformChain(node.id, nodes, edges);
       setLoading(true);
       API.previewTransform({
@@ -360,7 +356,6 @@ function NodePreviewPanel({ node, datasets, edges, nodes, onClose }) {
 
 // Build transform chain from root to a given node
 function buildTransformChain(targetNodeId, nodes, edges) {
-  // Trace path from input to target
   const path = [];
   let current = targetNodeId;
   while (current) {
@@ -400,7 +395,7 @@ function Modal({ title, onClose, children, width = 480 }) {
     </div>
   );
 }
-// Taruh di atas WorkflowEditor function, setelah imports
+
 export const toDagId = (name) =>
   (name || "untitled_workflow")
     .toLowerCase()
@@ -410,7 +405,6 @@ export const toDagId = (name) =>
 
 // ── Workflow Editor ────────────────────────────────────────────────────────────
 function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
-  // ── ALL HOOKS MUST COME FIRST — no early returns before this block ────────
   const [nodes, setNodes, onNodesChange] = useNodesState(workflow?.nodes || []);
   const [edges, setEdges, onEdgesChange] = useEdgesState(workflow?.edges || []);
   const [wfTab, setWfTab]               = useState("datasets");
@@ -425,7 +419,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "" });
   const pollRef = useRef(null);
   
-// Column propagation
   const columnMap = useMemo(() => computeNodeColumns(nodes, edges), [nodes, edges]);
 
   useEffect(() => {
@@ -446,7 +439,7 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
         }
         return n;
       });
-      return changed ? updated : ns; // Only update state if an actual change occurred
+      return changed ? updated : ns;
     });
   }, [columnMap, edges, setNodes]);
 
@@ -469,7 +462,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
       const isIO = ["input_dataset","output_dataset"].includes(n.data.type);
       if (isIO) {
         if (n.data.type === "output_dataset") {
-          // Pre-fill existing config for re-edit
           setOutputConfig({
             outputName: n.data.config?.outputName || "",
             description: n.data.config?.description || "",
@@ -491,7 +483,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
       return ns;
     }),
     onSaveAs: async (nid, format) => {
-      // Find the run_id for this output node by output name
       setNodes(ns => {
         const n = ns.find(x => x.id === nid);
         if (!n?.data?.config?.outputName) {
@@ -499,7 +490,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
           return ns;
         }
         const outName = n.data.config.outputName;
-        // Trigger download directly from warehouse
         const url = `/api/warehouse/${outName}/download?format=${format}`;
         const a = document.createElement("a");
         a.href = url;
@@ -510,7 +500,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     },
   }), [setNodes, toast]);
 
-  // Rebuild callbacks on load
   useEffect(() => {
     const cbs = buildCallbacks();
     setNodes(ns => ns.map(n => ({ ...n, data: { ...n.data, ...cbs } })));
@@ -519,7 +508,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const addNode = useCallback((item) => {
     const id = genId();
     const cbs = buildCallbacks();
-    // hapus setCounter karena tidak dipakai lagi
     setNodes(ns => [...ns, {
       id, type: "etlNode",
       position: { x: 80 + (ns.length % 4) * 230, y: 60 + Math.floor(ns.length / 4) * 180 },
@@ -574,7 +562,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     toast("Workflow saved!", "success");
   }, [nodes, edges, workflow, onSave, toast]);
 
-  // Build multi-branch tasks from output nodes
   const buildTasks = useCallback(() => {
     const outputNodes = nodes.filter(n => n.data.type === "output_dataset" && n.data.config?.outputName);
     const inputNode   = nodes.find(n => n.data.type === "input_dataset" && n.data.config?.dataset);
@@ -583,7 +570,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     return outputNodes.map((outNode, idx) => {
       const taskId    = outNode.data.config?.taskId || `task_${idx + 1}`;
       const transforms = buildTransformChain(outNode.id, nodes, edges).filter(t => t.type !== "output_dataset");
-      // Find dependencies (other output nodes that feed into this one via intermediate nodes)
       const depends_on = [];
       return { task_id: taskId, output_name: outNode.data.config.outputName, transforms, depends_on };
     });
@@ -598,7 +584,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     const unconfigOut = outputNodes.find(n => !n.data.config?.outputName);
     if (unconfigOut) return toast("All Output Dataset nodes must be configured", "error");
 
-    // Check all nodes are connected
     const utilNodes = nodes.filter(n => !["input_dataset","output_dataset"].includes(n.data.type));
     const disconnected = utilNodes.find(n => !edges.some(e => e.target === n.id));
     if (disconnected) return toast(`Node "${disconnected.data.label}" is not connected`, "error");
@@ -774,7 +759,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
                 boxShadow: "-6px 0 32px rgba(0,0,0,0.12)",
                 fontFamily: "'DM Sans',sans-serif",
               }}>
-                {/* Header */}
                 <div style={{ background: `linear-gradient(135deg,${C.green},${C.navyLight})`, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
                   <div>
                     <div style={{ color: C.white, fontWeight: 800, fontSize: 14 }}>📤 Configure Output</div>
@@ -785,7 +769,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
                   <button onClick={() => setOutputSidebarNodeId(null)} style={{ background: "rgba(255,255,255,0.15)", border: "none", borderRadius: 6, padding: "5px 9px", cursor: "pointer", color: C.white, fontSize: 16, fontWeight: 700 }}>×</button>
                 </div>
 
-                {/* DAG info banner */}
                 <div style={{ background: C.sparkTint, borderBottom: `1px solid ${C.spark}22`, padding: "8px 16px" }}>
                   <div style={{ fontSize: 10, color: C.spark, fontWeight: 700 }}>⚡ DAG Name</div>
                   <div style={{ fontSize: 12, fontFamily: "monospace", color: C.navy, fontWeight: 700, marginTop: 2 }}>{
@@ -798,7 +781,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
                   <div style={{ fontSize: 9, color: C.g400, marginTop: 1 }}>Each output node = one task in this DAG</div>
                 </div>
 
-                {/* Form body */}
                 <div style={{ flex: 1, overflow: "auto", padding: "16px" }}>
                   <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
 
@@ -862,7 +844,7 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
                       </div>
                     )}
 
-                    {/* Save As section — shown if already configured */}
+                    {/* Save As section */}
                     {isConfigured && (
                       <div style={{ borderTop: `1px solid ${C.g200}`, paddingTop: 14 }}>
                         <div style={{ fontSize: 11, fontWeight: 700, color: C.g600, marginBottom: 8 }}>
@@ -892,7 +874,6 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
                   </div>
                 </div>
 
-                {/* Footer buttons */}
                 <div style={{ padding: "14px 16px", borderTop: `1px solid ${C.g200}`, background: C.g50, flexShrink: 0 }}>
                   <div style={{ display: "flex", gap: 8 }}>
                     <button
@@ -1011,6 +992,16 @@ export default function ETLPipelineApp() {
   const [dbForm, setDbForm]         = useState({ host: "postgres", port: "5432", database: "airflow", username: "airflow", password: "airflow" });
   const [dbConnecting, setDbConnecting] = useState(false);
 
+  // Bulk import state
+  const [bulkFiles, setBulkFiles]             = useState([]);
+  const [bulkLoading, setBulkLoading]         = useState(false);
+  const [selectedBulkFiles, setSelectedBulkFiles] = useState([]);
+  const [bulkSaveParquet, setBulkSaveParquet] = useState(true);
+  const [bulkSkipExisting, setBulkSkipExisting] = useState(true);
+  const [bulkImporting, setBulkImporting]     = useState(false);
+  const [bulkJobId, setBulkJobId]             = useState(null);
+  const [bulkStatus, setBulkStatus]           = useState(null);
+
   const [pipelineRuns, setPipelineRuns] = useState([]);
   const [selectedRun, setSelectedRun]   = useState(null);
   const [runPreview, setRunPreview]     = useState(null);
@@ -1032,16 +1023,14 @@ export default function ETLPipelineApp() {
   }, []);
 
   useEffect(() => {
-      // Workflow: INSTANT dari cache (tidak perlu await)
     setWorkflows(API.getWorkflows());
 
-    // Airflow health: fire and forget
     axios.get("/airflow-api/health")
       .then(() => setAirflowOk(true))
       .catch(() => setAirflowOk(false));
     loadDatasets();
     loadWarehouse();
-    }, []);
+  }, []);
 
   const loadDatasets = async () => {
     setDsLoading(true);
@@ -1075,6 +1064,66 @@ export default function ETLPipelineApp() {
     finally { setPreviewLoading(false); }
   };
 
+  // ── Trigger scan of /data_csv on switching to bulk ──────────────────
+  useEffect(() => {
+    if (addTab === "bulk") {
+      setBulkLoading(true);
+      api.get("/directory/bulk-preview")
+        .then(r => {
+          const files = Array.isArray(r.data) ? r.data : [];
+          setBulkFiles(files);
+          setSelectedBulkFiles(files.map(f => f.name));
+        })
+        .catch(() => toast("Failed to load directory files preview", "error"))
+        .finally(() => setBulkLoading(false));
+    }
+  }, [addTab]);
+
+  const handleBulkImport = async () => {
+    if (!selectedBulkFiles.length) return toast("Select at least one file to import", "error");
+    setBulkImporting(true);
+    setBulkStatus(null);
+    try {
+      const r = await api.post("/directory/bulk-import", {
+        save_parquet: bulkSaveParquet,
+        skip_existing: bulkSkipExisting,
+        file_filter: selectedBulkFiles,
+      });
+      const bId = r.data.bulk_id;
+      setBulkJobId(bId);
+
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await api.get(`/directory/bulk-status/${bId}`);
+          const job = statusRes.data;
+          setBulkStatus(job);
+
+          if (job.overall_status === "done" || job.status === "done") {
+            clearInterval(poll);
+            setBulkImporting(false);
+            toast("Bulk import complete!", "success");
+            await loadDatasets();
+            await loadWarehouse();
+            setShowAddModal(false);
+            setBulkJobId(null);
+            setBulkStatus(null);
+          } else if (job.status === "error") {
+            clearInterval(poll);
+            setBulkImporting(false);
+            toast(`Bulk import failed: ${job.message}`, "error");
+          }
+        } catch {
+          clearInterval(poll);
+          setBulkImporting(false);
+        }
+      }, 1500);
+
+    } catch (e) {
+      setBulkImporting(false);
+      toast(e.response?.data?.detail || "Failed to launch bulk import", "error");
+    }
+  };
+
   const handleUpload = async () => {
     if (!uploadFile) return toast("Select a file first", "error");
     setUploading(true);
@@ -1083,7 +1132,6 @@ export default function ETLPipelineApp() {
     setUploadJobId(null);
 
     try {
-      // ── Phase 1: XHR upload with transfer progress ──────────────────
       const formData = new FormData();
       formData.append("file", uploadFile);
       if (uploadName) formData.append("name", uploadName);
@@ -1094,7 +1142,7 @@ export default function ETLPipelineApp() {
 
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable) {
-            const pct = Math.round((e.loaded / e.total) * 40); // upload = 0–40%
+            const pct = Math.round((e.loaded / e.total) * 40);
             setUploadPct(pct);
             setUploadMsg(`Uploading… ${(e.loaded / 1024 / 1024).toFixed(1)} / ${(e.total / 1024 / 1024).toFixed(1)} MB`);
           }
@@ -1122,10 +1170,9 @@ export default function ETLPipelineApp() {
       setUploadPct(42);
       setUploadMsg("File received — processing in background…");
 
-      // ── Phase 2: Poll background job status ──────────────────────────
       let done = false;
       let attempt = 0;
-      const MAX_POLL = 600; // 10 min max
+      const MAX_POLL = 600;
 
       while (!done && attempt < MAX_POLL) {
         await new Promise(r => setTimeout(r, 1200));
@@ -1135,7 +1182,6 @@ export default function ETLPipelineApp() {
           const r = await api.get(`/datasets/upload/status/${jobId}`);
           const job = r.data;
 
-          // job.pct from worker is 5–100; we map it to 42–100 after upload phase
           const displayPct = job.pct >= 42 ? job.pct : 42 + Math.round((job.pct / 50) * 20);
           setUploadPct(Math.min(99, displayPct));
           setUploadMsg(job.message || "Processing…");
@@ -1155,7 +1201,6 @@ export default function ETLPipelineApp() {
                 : "Dataset uploaded & deployed!",
               "success"
             );
-            // Brief delay so user sees 100%
             await new Promise(r => setTimeout(r, 900));
             setShowAddModal(false);
             setUploadFile(null);
@@ -1207,7 +1252,7 @@ export default function ETLPipelineApp() {
     if (!newWfForm.name.trim()) return toast("Workflow name required", "error");
     const wf = {
       id:          `wf_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
-      name:        newWfForm.name.trim(),   // ← trim() pastikan tidak whitespace
+      name:        newWfForm.name.trim(),
       description: newWfForm.description || "",
       nodes:       [],
       edges:       [],
@@ -1249,7 +1294,7 @@ export default function ETLPipelineApp() {
   });
 
   const filteredWF = workflows.filter(w => {
-    if (!w || !w.id) return false; // buang data corrupt
+    if (!w || !w.id) return false;
     const ms = (w.name || "").toLowerCase().includes(wfSearch.toLowerCase());
     const mt = wfFilter === "all" || w.status === wfFilter;
     return ms && mt;
@@ -1268,8 +1313,6 @@ export default function ETLPipelineApp() {
     return (
       <div style={{ display: "flex", height: "100vh", fontFamily: "'DM Sans','Segoe UI',sans-serif", overflow: "hidden" }}>
         <style>{`*{box-sizing:border-box;margin:0;padding:0}`}</style>
-        {/* key={activeWorkflow.id} ensures WorkflowEditor fully remounts when switching workflows,
-            so useNodesState re-initializes with the correct saved nodes/edges */}
         <WorkflowEditor
           key={activeWorkflow.id}
           workflow={activeWorkflow}
@@ -1591,10 +1634,11 @@ export default function ETLPipelineApp() {
       {showAddModal && (
         <Modal title="Add Data Source" onClose={() => setShowAddModal(false)}>
           <div style={{ display: "flex", borderBottom: `1px solid ${C.g200}`, marginBottom: 20 }}>
-            {[{id:"csv",l:"CSV"},{id:"excel",l:"Excel"},{id:"postgres",l:"PostgreSQL"},{id:"mysql",l:"MySQL"}].map(({id,l}) => (
+            {[{id:"csv",l:"CSV"},{id:"excel",l:"Excel"},{id:"postgres",l:"PostgreSQL"},{id:"mysql",l:"MySQL"},{id:"bulk",l:"Bulk Import"}].map(({id,l}) => (
               <button key={id} onClick={() => setAddTab(id)} style={{ flex: 1, padding: "10px 0", fontSize: 11, fontWeight: 700, border: "none", cursor: "pointer", borderBottom: addTab===id?`2px solid ${C.blue}`:"2px solid transparent", background: "none", color: addTab===id?C.blue:C.g400 }}>{l}</button>
             ))}
           </div>
+
           {(addTab==="csv"||addTab==="excel") && (
             <div>
               <label style={{ display: "block", border: `2px dashed ${uploadFile?C.blue:C.g300}`, borderRadius: 10, padding: "24px 20px", textAlign: "center", background: uploadFile?C.blueTint:C.g50, cursor: uploading?"not-allowed":"pointer", marginBottom: 12, opacity: uploading ? 0.7 : 1 }}>
@@ -1608,7 +1652,6 @@ export default function ETLPipelineApp() {
                 </div>
               </label>
 
-              {/* File size warning for large files */}
               {uploadFile && uploadFile.size >= 5*1024*1024*1024 && (
                 <div style={{ background: C.sparkTint, border: `1px solid ${C.spark}33`, borderRadius: 8, padding: "8px 12px", fontSize: 11, color: C.spark, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
                   <Ic.Spark />
@@ -1616,7 +1659,6 @@ export default function ETLPipelineApp() {
                 </div>
               )}
 
-              {/* Progress bar */}
               {uploading && (
                 <div style={{ marginBottom: 12 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.g600, marginBottom: 5, fontWeight: 600 }}>
@@ -1634,7 +1676,6 @@ export default function ETLPipelineApp() {
                       transition: "width 0.4s ease",
                     }} />
                   </div>
-                  {/* Phase indicators */}
                   <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
                     {[
                       { label: "Upload", start: 0, end: 42 },
@@ -1656,6 +1697,7 @@ export default function ETLPipelineApp() {
               <input value={uploadName} disabled={uploading} onChange={e=>setUploadName(e.target.value)} placeholder="Dataset name (optional)" style={{width:"100%",padding:"9px 12px",borderRadius:8,border:`1px solid ${C.g200}`,fontSize:13,boxSizing:"border-box",outline:"none",color:C.g700, opacity: uploading ? 0.6 : 1}}/>
             </div>
           )}
+
           {(addTab==="postgres"||addTab==="mysql") && (
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
               {[{k:"host",l:"Host",ph:addTab==="postgres"?"postgres":"localhost"},{k:"port",l:"Port",ph:addTab==="postgres"?"5432":"3306"},{k:"database",l:"Database",ph:"airflow"},{k:"username",l:"Username",ph:addTab==="postgres"?"airflow":"root"},{k:"password",l:"Password",ph:"••••••••",t:"password"}].map(({k,l,ph,t})=>(
@@ -1666,13 +1708,125 @@ export default function ETLPipelineApp() {
               ))}
             </div>
           )}
+
+          {/* ── BULK IMPORT TAB INTERFACE ──────────────────────────────────── */}
+          {addTab === "bulk" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {bulkLoading && <div style={{ textAlign: "center", color: C.g400, padding: 20 }}>Scanning /data_csv directory…</div>}
+              
+              {!bulkLoading && !bulkJobId && (
+                <>
+                  <div style={{ background: C.blueTint, borderRadius: 8, padding: 12, fontSize: 11, color: C.blue }}>
+                    <strong>Bulk Import Mode</strong> — Automatically scan <code>/data_csv</code> and import files concurrently to the staging database schema.
+                  </div>
+
+                  <div style={{ display: "flex", gap: 14, background: C.g50, borderRadius: 8, padding: 10 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 600, color: C.g700, cursor: "pointer" }}>
+                      <input type="checkbox" checked={bulkSaveParquet} onChange={e => setBulkSaveParquet(e.target.checked)} />
+                      Save as Parquet
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 600, color: C.g700, cursor: "pointer" }}>
+                      <input type="checkbox" checked={bulkSkipExisting} onChange={e => setBulkSkipExisting(e.target.checked)} />
+                      Skip Existing Tables
+                    </label>
+                  </div>
+
+                  <div style={{ border: `1px solid ${C.g200}`, borderRadius: 8, overflow: "hidden" }}>
+                    <div style={{ background: C.g100, padding: "6px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: C.g600 }}>Files in /data_csv ({bulkFiles.length})</span>
+                      <button 
+                        onClick={() => {
+                          if (selectedBulkFiles.length === bulkFiles.length) setSelectedBulkFiles([]);
+                          else setSelectedBulkFiles(bulkFiles.map(f => f.name));
+                        }}
+                        style={{ border: "none", background: "none", color: C.blue, fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                      >
+                        {selectedBulkFiles.length === bulkFiles.length ? "Deselect All" : "Select All"}
+                      </button>
+                    </div>
+
+                    <div style={{ maxHeight: 180, overflowY: "auto", padding: "4px 0" }}>
+                      {bulkFiles.map(f => (
+                        <div key={f.name} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 12px", borderBottom: `1px solid ${C.g100}` }}>
+                          <input 
+                            type="checkbox" 
+                            checked={selectedBulkFiles.includes(f.name)} 
+                            onChange={e => {
+                              if (e.target.checked) setSelectedBulkFiles(prev => [...prev, f.name]);
+                              else setSelectedBulkFiles(prev => prev.filter(name => name !== f.name));
+                            }} 
+                          />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: C.g700, textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>{f.name}</div>
+                            <div style={{ fontSize: 9, color: C.g400 }}>
+                              {f.size_str} · table: <span style={{ fontFamily: "monospace" }}>staging.{f.table_name}</span>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", gap: 4 }}>
+                            {f.already_imported && <span style={{ fontSize: 9, padding: "2px 5px", borderRadius: 4, background: C.greenTint, color: C.green, fontWeight: 700 }}>Staged</span>}
+                            {f.mode === "streaming" && <span style={{ fontSize: 9, padding: "2px 5px", borderRadius: 4, background: C.sparkTint, color: C.spark, fontWeight: 700 }}>Stream</span>}
+                          </div>
+                        </div>
+                      ))}
+                      {bulkFiles.length === 0 && (
+                        <div style={{ padding: 24, textAlign: "center", color: C.g400, fontSize: 11 }}>No supported files found in /data_csv</div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {bulkJobId && bulkStatus && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.g700, fontWeight: 700 }}>
+                    <span>{bulkStatus.message || "Importing files…"}</span>
+                    <span style={{ color: C.blue }}>{bulkStatus.progress_pct || 0}%</span>
+                  </div>
+                  <div style={{ height: 8, background: C.g200, borderRadius: 99, overflow: "hidden" }}>
+                    <div style={{
+                      height: "100%",
+                      width: `${bulkStatus.progress_pct || 0}%`,
+                      background: `linear-gradient(90deg, ${C.blue}, ${C.green})`,
+                      transition: "width 0.3s ease",
+                    }} />
+                  </div>
+
+                  <div style={{ maxHeight: 200, overflowY: "auto", border: `1px solid ${C.g200}`, borderRadius: 8, padding: "4px 0" }}>
+                    {Object.entries(bulkStatus.files || {}).map(([fname, fstate]) => {
+                      const st = fstate.status || "pending";
+                      const color = { done: C.green, error: C.red, running: C.blue, skipped: C.g500 }[st] || C.g400;
+                      return (
+                        <div key={fname} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 12px", borderBottom: `1px solid ${C.g100}` }}>
+                          <div style={{ minWidth: 0, flex: 1, marginRight: 10 }}>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: C.g700, textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>{fname}</div>
+                            <div style={{ fontSize: 9, color: C.g400 }}>{fstate.message}</div>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontSize: 10, fontWeight: 700, color }}>{st.toUpperCase()}</span>
+                            {st === "running" && <span style={{ fontSize: 10, fontWeight: 700, color: C.blue }}>{fstate.pct}%</span>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{display:"flex",gap:8,marginTop:18}}>
-            <button onClick={()=>{ if(!uploading){ setShowAddModal(false); setUploadFile(null); setUploadName(""); setUploadPct(0); setUploadMsg(""); }}} disabled={uploading && uploadPct < 100} style={{flex:1,padding:"9px 0",borderRadius:8,border:`1px solid ${C.g200}`,background:C.white,color:C.g600,fontSize:13,fontWeight:600,cursor:"pointer"}}>
-              {uploading ? "Processing…" : "Cancel"}
+            <button onClick={()=>{ if(!uploading && !bulkImporting){ setShowAddModal(false); setUploadFile(null); setUploadName(""); setUploadPct(0); setUploadMsg(""); setBulkJobId(null); setBulkStatus(null); }}} disabled={(uploading && uploadPct < 100) || bulkImporting} style={{flex:1,padding:"9px 0",borderRadius:8,border:`1px solid ${C.g200}`,background:C.white,color:C.g600,fontSize:13,fontWeight:600,cursor:"pointer"}}>
+              {uploading || bulkImporting ? "Processing…" : "Cancel"}
             </button>
-            <button onClick={addTab==="csv"||addTab==="excel"?handleUpload:handleConnectDB} disabled={uploading||dbConnecting} style={{flex:2,padding:"9px 0",borderRadius:8,background:uploading||dbConnecting?C.g200:`linear-gradient(90deg,${C.blue},${C.blueMid})`,border:"none",color:uploading||dbConnecting?C.g500:C.white,fontSize:13,fontWeight:700,cursor:uploading||dbConnecting?"not-allowed":"pointer",position:"relative",overflow:"hidden"}}>
-              {uploading ? (
-                <span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+            <button 
+              onClick={addTab === "bulk" ? handleBulkImport : (addTab === "csv" || addTab === "excel" ? handleUpload : handleConnectDB)} 
+              disabled={uploading || dbConnecting || bulkImporting || (addTab === "bulk" && !selectedBulkFiles.length)} 
+              style={{flex:2,padding:"9px 0",borderRadius:8,background:uploading||dbConnecting||bulkImporting?C.g200:`linear-gradient(90deg,${C.blue},${C.blueMid})`,border:"none",color:uploading||dbConnecting||bulkImporting?C.g500:C.white,fontSize:13,fontWeight:700,cursor:uploading||dbConnecting||bulkImporting||(addTab === "bulk" && !selectedBulkFiles.length)?"not-allowed":"pointer",position:"relative",overflow:"hidden"}}
+            >
+              {addTab === "bulk" ? (
+                bulkImporting ? "Importing Bulk…" : `Import ${selectedBulkFiles.length} File(s)`
+              ) : uploading ? (
+                <span style={{display:"align-items-center",justifyContent:"center",gap:6}}>
                   <span style={{display:"inline-block",width:12,height:12,border:`2px solid ${C.g400}`,borderTopColor:C.blue,borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>
                   {uploadPct}% — {uploadPct < 42 ? "Uploading…" : uploadPct < 65 ? "Parsing…" : uploadPct < 97 ? "Inserting…" : "Finalizing…"}
                 </span>

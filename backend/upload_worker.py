@@ -684,6 +684,101 @@ def _save_dataset_meta(
         cur.close()
         conn.close()
 
+# ── In-memory job store untuk single upload ──────────────────────
+_jobs: dict = {}
+_jobs_lock  = threading.Lock()
+
+def _set(job_id: str, **kwargs):
+    with _jobs_lock:
+        if job_id not in _jobs:
+            _jobs[job_id] = {}
+        _jobs[job_id].update(kwargs)
+
+def get_job(job_id: str) -> dict:
+    return _jobs.get(job_id, {})
+
+
+def process_upload(
+    job_id: str,
+    tmp_path: str,
+    filename: str,
+    file_size_bytes: int,
+) -> None:
+    """Process single file upload di background thread."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "csv"
+    table_name = sanitize_table(
+        filename.rsplit(".", 1)[0] if "." in filename else filename
+    )
+    size_mb  = file_size_bytes / (1024 * 1024)
+    is_large = size_mb >= LARGE_FILE_MB
+
+    try:
+        _set(job_id, status="processing", pct=5,
+             message="Membaca file…", is_large=is_large)
+
+        if ext == "csv":
+            if is_large:
+                result = _import_csv_streaming(
+                    job_id, tmp_path, table_name, file_size_bytes,
+                    save_parquet=True
+                )
+            else:
+                df = pd.read_csv(tmp_path, low_memory=False)
+                result = _import_df(
+                    job_id, filename, df, table_name,
+                    file_size_bytes, save_parquet=False
+                )
+
+        elif ext in ("xlsx", "xls"):
+            _set(job_id, pct=10, message="Membaca Excel…")
+            df = pd.read_excel(tmp_path)
+            result = _import_df(
+                job_id, filename, df, table_name,
+                file_size_bytes, save_parquet=False
+            )
+
+        elif ext == "parquet":
+            if is_large:
+                result = _import_parquet_streaming(
+                    job_id, tmp_path, table_name, file_size_bytes
+                )
+            else:
+                df = pd.read_parquet(tmp_path, engine="pyarrow")
+                result = _import_df(
+                    job_id, filename, df, table_name,
+                    file_size_bytes, save_parquet=False
+                )
+        else:
+            _set(job_id, status="error", pct=100,
+                 message=f"Format tidak didukung: {ext}")
+            return
+
+        _save_dataset_meta(
+            filename=filename, ext=ext, table_name=table_name,
+            row_count=result["row_count"], col_count=result["col_count"],
+            size_bytes=file_size_bytes,
+            parquet_path=result.get("parquet_path"),
+            is_large=is_large,
+        )
+
+        _set(job_id,
+             status="done", pct=100,
+             message=f"Selesai — {result['row_count']:,} rows",
+             row_count=result["row_count"],
+             col_count=result["col_count"],
+             table_name=table_name,
+             is_large=is_large,
+             parquet_path=result.get("parquet_path"))
+
+    except Exception as e:
+        _set(job_id, status="error", pct=100,
+             message=str(e), error=traceback.format_exc())
+        print(f"[Upload] Error {filename}: {traceback.format_exc()}")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 # ════════════════════════════════════════════════════════════════════════════
 # BULK IMPORT: semua file dari /data_csv
