@@ -20,7 +20,6 @@ from pathlib import Path
 import upload_worker
 import spark_engine
 
-
 app = FastAPI(title="ETLFlow API")
 
 app.add_middleware(
@@ -199,11 +198,22 @@ def _build_duckdb_sql(input_alias: str, transforms: list, limit: Optional[int] =
                 else_v  = config.get("elseValue", "")
                 if not src or not whens:
                     step -= 1; continue
-                when_clauses = " ".join(
-                    f'WHEN "{src}" {w["condition"]} {repr(w["value"])} THEN {repr(w["result"])}'
-                    for w in whens if w.get("value") and w.get("result")
-                )
-                case_expr = f'CASE {when_clauses} ELSE {repr(else_v)} END AS "{new_col}"'
+                fragments = []
+                for w in whens:
+                    condition = w.get("condition", "=")
+                    value     = w.get("value", "")
+                    result    = w.get("result", "")
+                    # IS NULL / IS NOT NULL tidak butuh value, sisanya wajib punya value
+                    if condition not in ("IS NULL", "IS NOT NULL") and value == "":
+                        continue
+                    if result == "" and result != 0:
+                        continue
+                    frag = _sql_when_fragment(src, condition, value, result)
+                    if frag:
+                        fragments.append(frag)
+                if not fragments:
+                    step -= 1; continue
+                case_expr = f'CASE {" ".join(fragments)} ELSE {repr(else_v)} END AS "{new_col}"'
                 cte_parts.append(f"{alias} AS (SELECT *, {case_expr} FROM {cur_alias})")
                 if cur_cols:
                     cur_cols = cur_cols + [new_col]
@@ -501,6 +511,31 @@ def _get_conn():
 def _q(cols):
     return ", ".join(f\'"{c}"\' for c in cols)
 
+def _sql_when_fragment(col, condition, value, result):
+    result_lit = repr(result)
+    col_ref = f\'"{col}"\'
+    if condition == \'IS NULL\':
+        return f"WHEN {col_ref} IS NULL THEN {result_lit}"
+    if condition == \'IS NOT NULL\':
+        return f"WHEN {col_ref} IS NOT NULL THEN {result_lit}"
+    if condition in (\'IN\', \'NOT IN\'):
+        vals = [v.strip() for v in str(value).split(\',\') if v.strip() != \'\']
+        if not vals:
+            return None
+        vals_sql = \', \'.join(repr(v) for v in vals)
+        op = \'IN\' if condition == \'IN\' else \'NOT IN\'
+        return f"WHEN {col_ref} {op} ({vals_sql}) THEN {result_lit}"
+    if condition == \'LIKE\':
+        return f"WHEN {col_ref} LIKE {repr(value)} THEN {result_lit}"
+    if condition in (\'>\', \'>=\', \'<\', \'<=\'):
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return f"WHEN TRY_CAST({col_ref} AS DOUBLE) {condition} {num} THEN {result_lit}"
+    op = condition if condition in (\'=\', \'!=\') else \'=\'
+    return f"WHEN {col_ref} {op} {repr(value)} THEN {result_lit}"
+
 
 def _estimate_mb(pg_conn, table):
     try:
@@ -627,10 +662,19 @@ def _build_transform_sql(input_alias, transforms, limit=None):
                 whens   = config.get('whens',[])
                 else_v  = config.get('elseValue','')
                 if not src or not whens: step -= 1; continue
-                wc = ' '.join(
-                    f\'WHEN "{src}" {w["condition"]} {repr(w["value"])} THEN {repr(w["result"])}\'
-                    for w in whens if w.get('value') and w.get('result')
-                )
+                fragments = []
+                for w in whens:
+                    condition = w.get(\'condition\', \'=\')
+                    value     = w.get(\'value\', \'\')
+                    result    = w.get(\'result\', \'\')
+                    if condition not in (\'IS NULL\', \'IS NOT NULL\') and value == \'\':
+                        continue
+                    frag = _sql_when_fragment(src, condition, value, result)
+                    if frag:
+                        fragments.append(frag)
+                if not fragments:
+                    step -= 1; continue
+                wc = \' \'.join(fragments)
                 cte_parts.append(f\'{alias} AS (SELECT *, CASE {wc} ELSE {repr(else_v)} END AS "{new_col}" FROM {cur_alias})\')
                 if cur_cols: cur_cols = cur_cols + [new_col]
             elif ntype == 'fill_null':

@@ -29,6 +29,65 @@ _spark_session = None  # singleton per-proses, dipakai ulang antar preview call
 # 1. DYNAMIC SPARK CONFIG — "measure size -> generate config -> submit"
 # ════════════════════════════════════════════════════════════════════════════
 
+SPARK_TYPE_MAP = {
+    "TEXT": "string", "INTEGER": "int", "BIGINT": "bigint",
+    "NUMERIC": "double", "BOOLEAN": "boolean",
+    "DATE": "date", "TIMESTAMP": "timestamp", "VARCHAR(255)": "string",
+}
+
+def _pg_table_size_mb(table: str) -> float:
+    """
+    Estimasi ukuran tabel via katalog Postgres (pg_total_relation_size) —
+    TIDAK memicu Spark action, jadi murah dan tidak jadi bottleneck.
+    Dipakai untuk keputusan broadcast join.
+    """
+    import psycopg2
+    try:
+        conn = psycopg2.connect(
+            host="postgres", port=5432, database="airflow",
+            user="airflow", password="airflow",
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0", (table,))
+        val = float(cur.fetchone()[0] or 0)
+        cur.close(); conn.close()
+        return val
+    except Exception:
+        return 9999.0  # tidak diketahui -> jangan broadcast, aman
+
+
+def _build_when_condition(col: str, condition: str, value):
+    """
+    Bangun kondisi Spark untuk SEMUA jenis condition di val_mapper,
+    bukan cuma '='. Cocok dengan daftar CONDITIONS di UtilityConfigs.jsx:
+    ["=","!=",">",">=","<","<=","LIKE","IS NULL","IS NOT NULL","IN","NOT IN"]
+    """
+    from pyspark.sql import functions as F
+    c = F.col(col)
+
+    if condition == "=":
+        return c == value
+    if condition == "!=":
+        return c != value
+    if condition in (">", ">=", "<", "<="):
+        num = float(value)
+        c_num = c.cast("double")
+        return {">": c_num > num, ">=": c_num >= num,
+                "<": c_num < num, "<=": c_num <= num}[condition]
+    if condition == "LIKE":
+        return c.like(value)
+    if condition == "IS NULL":
+        return c.isNull()
+    if condition == "IS NOT NULL":
+        return c.isNotNull()
+    if condition == "IN":
+        vals = [v.strip() for v in str(value).split(",")]
+        return c.isin(*vals)
+    if condition == "NOT IN":
+        vals = [v.strip() for v in str(value).split(",")]
+        return ~c.isin(*vals)
+    return c == value  # fallback aman
+
 def compute_spark_config(size_mb: float) -> dict:
     """Smart-scaling: config Spark otomatis mengikuti ukuran data input."""
     if size_mb < 100:
@@ -347,14 +406,6 @@ def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup)
     return df
 
 
-def _estimate_df_size_mb(df) -> float:
-    """Estimasi kasar untuk keputusan broadcast join."""
-    try:
-        return (df.count() * len(df.columns) * 40) / (1024 * 1024)
-    except Exception:
-        return 9999  # tidak diketahui -> jangan broadcast
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # 5. ENTRY POINT PREVIEW
 # ════════════════════════════════════════════════════════════════════════════
@@ -390,6 +441,7 @@ def preview_pipeline_spark(
     order    = topo_order(nodes, edges)
 
     materialized = {}
+    right_sizes  = {} 
     cache_hits, cache_writes = [], []
 
     def resolve_right_df(right_node_id):
@@ -401,10 +453,15 @@ def preview_pipeline_spark(
         ds = rnode.get("data", {}).get("config", {}).get("dataset")
         if not ds:
             return None
-        r_table = f'staging."{ds.get("table_name") or ds.get("name")}"'
+        table_name = ds.get("table_name") or ds.get("name")
+        r_table = f'staging."{table_name}"'
         r_df = read_source_once(spark, r_table)
         materialized[right_node_id] = r_df
+        right_sizes[right_node_id]  = _pg_table_size_mb(r_table)  # NEW
         return r_df
+
+    def resolve_right_size(right_node_id):                       # NEW
+        return right_sizes.get(right_node_id, 9999.0)
 
     # ── Baca source utama SEKALI ─────────────────────────────────────────
     input_node = next((n for n in nodes if n["data"]["type"] == "input_dataset"), None)
@@ -433,7 +490,10 @@ def preview_pipeline_spark(
             cache_hits.append(nid)
             continue
 
-        result_df = apply_node_transform(spark, parent_df, node, node_map, resolve_right_df)
+        result_df = apply_node_transform(
+            spark, parent_df, node, node_map,
+            resolve_right_df, resolve_right_size,
+        )
 
         # Shared node (fan-out > 1) -> materialize ke Parquet sekali,
         # semua branch downstream reuse hasil ini.

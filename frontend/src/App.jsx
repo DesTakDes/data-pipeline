@@ -246,38 +246,53 @@ function NodePreviewPanel({ node, datasets, edges, nodes, onClose }) {
 
   useEffect(() => {
     if (!node) return;
+
     if (isInput && dsId) {
       setLoading(true);
       API.previewDataset(dsId, 50)
         .then(r => setData(r.data))
         .catch(() => setError("Could not load preview"))
         .finally(() => setLoading(false));
-    } else if (!isInput && !isOutput) {
-      const colMap = computeNodeColumns(nodes, edges);
+      return;
+    }
+
+    // Utility node ATAU Output node -> preview lewat Spark pipeline engine
+    if (!isInput) {
       const sourceEdge = edges.find(e => e.target === node.id);
       if (!sourceEdge) {
         setData({ columns: [], rows: [], info: "Connect to upstream node first" });
         return;
       }
-      const inputNode = nodes.find(n => n.data?.type === "input_dataset" && n.data?.config?.dataset?.id);
+
+      const inputNode = nodes.find(
+        n => n.data?.type === "input_dataset" && n.data?.config?.dataset?.id
+      );
       if (!inputNode) {
+        const colMap = computeNodeColumns(nodes, edges);
         setData({ columns: colMap[node.id] || [], rows: [], info: "No input dataset connected" });
         return;
       }
-      const chain = buildTransformChain(node.id, nodes, edges);
+
       setLoading(true);
-      API.previewTransform({
-        dataset_id: inputNode.data.config.dataset.id,
-        transforms: chain,
-        limit: 50,
+      api.post("/preview/spark-pipeline", {
+        nodes: nodes.map(n => ({ id: n.id, data: { type: n.data.type, config: n.data.config } })),
+        edges: edges.map(e => ({ source: e.source, target: e.target })),
+        target_node_id: node.id,
+        limit: 100,
       })
         .then(r => setData(r.data))
-        .catch(e => setData({ columns: colMap[node.id] || [], rows: [], info: "Preview needs connected pipeline" }))
+        .catch(() => {
+          const colMap = computeNodeColumns(nodes, edges);
+          setData({
+            columns: colMap[node.id] || [],
+            rows: [],
+            info: "Preview butuh Input Dataset yang sudah terhubung",
+          });
+        })
         .finally(() => setLoading(false));
-    } else {
-      setData({ columns: [], rows: [] });
     }
   }, [node?.id]);
+
 
   const downloadCSV = () => {
     if (!data?.rows?.length) return;
