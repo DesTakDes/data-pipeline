@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
 import upload_worker
+import spark_engine
+
 
 app = FastAPI(title="ETLFlow API")
 
@@ -1137,11 +1139,11 @@ def generate_dag(
     tasks:        list,
     description:  str = "",
     execution_timeout_minutes: int = 90,
-) -> tuple[str, list[tuple[str, str]]]:
+) -> tuple[str, list[tuple[str, str]], dict]:
     """
-    Returns (dag_file_content, [(task_filename, task_file_content), ...])
+    Returns (dag_file_content, [(task_filename, task_file_content), ...], task_outputs)
     """
-    dag_content   = generate_workflow_dag(
+    dag_content = generate_workflow_dag(
         dag_id=dag_id,
         workflow_id=workflow_id,
         workflow_name=workflow_name,
@@ -1150,8 +1152,7 @@ def generate_dag(
         execution_timeout_minutes=execution_timeout_minutes,
     )
 
-    # ── 1. MAP OUTPUT TABLE UNTUK SETIAP TASK ──
-    # Ini mendefinisikan tabel hasil keluaran di PostgreSQL untuk setiap task_id
+    # ── Map output table per task_id (dipakai untuk resolusi input antar-task) ──
     task_outputs = {}
     for t in tasks:
         tid = t["task_id"]
@@ -1166,21 +1167,17 @@ def generate_dag(
         task_id    = re.sub(r'[^a-z0-9_]', '_', task["task_id"].lower()).strip('_')
         depends_on = task.get("depends_on", [])
 
-        # ── 2. RESOLUSI INPUT TABLE DENGAN ATURAN MULTIBRANCH DEPENDENCY ──
         if task.get("input_table"):
-            # Jika user mendefinisikan tabel input secara manual
             raw_task_input = task["input_table"]
         elif depends_on:
-            # Jika task bergantung pada task lain, ambil output dari task induk pertama
             parent_id = depends_on[0]
             raw_task_input = task_outputs.get(parent_id, input_table)
         else:
-            # Jika merupakan root task, gunakan input global alur kerja
             raw_task_input = input_table
 
         safe_task_input = re.sub(r'[^a-zA-Z0-9_.]', '', raw_task_input) if raw_task_input else ""
 
-        task_code  = generate_task_file(
+        task_code = generate_task_file(
             task_id=task_id,
             dag_id=dag_id,
             workflow_id=workflow_id,
@@ -1191,10 +1188,10 @@ def generate_dag(
         )
         task_files.append((f"task_{task_id}.py", task_code))
 
-    return dag_content, task_files
-    
-generate_spark_dag = generate_dag
+    return dag_content, task_files, task_outputs
 
+
+generate_spark_dag = generate_dag
 
 # ════════════════════════════════════════════════════════════════════════════
 # HEALTH
@@ -1615,11 +1612,13 @@ def run_pipeline(payload: dict):
     """
     Trigger a pipeline run.
 
-    File layout written to DAGS_FOLDER:
-        dag_{dag_id}.py              ← workflow orchestrator (imports tasks)
-        tasks/
-            __init__.py              ← makes tasks/ a Python package
-            task_{task_id}.py        ← one file per output node
+    Struktur folder yang dihasilkan (per-workflow):
+        DAGS_FOLDER/
+        └── {dag_id}/
+            ├── {dag_id}.py         ← workflow orchestrator (dibaca Airflow)
+            └── tasks/
+                ├── __init__.py     ← agar tasks/ jadi Python package
+                └── task_{task_id}.py  ← satu file per output node
     """
     workflow_id   = payload.get("workflow_id",   f"wf_{int(time.time())}")
     workflow_name = payload.get("workflow_name", "Pipeline")
@@ -1631,7 +1630,7 @@ def run_pipeline(payload: dict):
     # Legacy single-task support
     if not tasks and payload.get("output_name"):
         tasks = [{
-            "task_id":    "task_1",
+            "task_id":     "task_1",
             "output_name": payload.get("output_name", "output"),
             "transforms":  payload.get("transforms", []),
             "depends_on":  [],
@@ -1649,19 +1648,18 @@ def run_pipeline(payload: dict):
     if not dag_id:
         dag_id = f"etl_pipeline_{int(time.time())}"
 
-    # ── Ensure folder structure ───────────────────────────────────────────
+    # ── Buat folder khusus workflow ini + subfolder tasks/ ──────────────────
+    workflow_dir = Path(DAGS_FOLDER) / dag_id
+    tasks_dir    = workflow_dir / "tasks"
     try:
-        os.makedirs(DAGS_FOLDER, exist_ok=True)
-        tasks_dir = Path(DAGS_FOLDER) / "tasks"
-        tasks_dir.mkdir(exist_ok=True)
-        # Create tasks/__init__.py so Python treats it as a package
+        os.makedirs(tasks_dir, exist_ok=True)
         init_file = tasks_dir / "__init__.py"
         if not init_file.exists():
             init_file.write_text("# Auto-generated — task modules package\n")
     except Exception as e:
-        print(f"[DAG] Warning: could not create folder structure: {e}")
+        print(f"[DAG] Warning: could not create workflow folder {workflow_dir}: {e}")
 
-    # ── Check if DAG already exists in Airflow ────────────────────────────
+    # ── Cek apakah DAG sudah terdaftar di Airflow ───────────────────────────
     dag_exists = False
     try:
         r = requests.get(f"{AIRFLOW_URL}/api/v1/dags/{dag_id}", auth=AIRFLOW_AUTH, timeout=5)
@@ -1669,9 +1667,9 @@ def run_pipeline(payload: dict):
     except Exception as e:
         print(f"[DAG] Could not check Airflow: {e}")
 
-    # ── Generate files ────────────────────────────────────────────────────
+    # ── Generate isi file DAG + file-file task ──────────────────────────────
     try:
-        dag_content, task_files = generate_dag(
+        dag_content, task_files, task_outputs = generate_dag(
             dag_id=dag_id,
             workflow_id=workflow_id,
             workflow_name=workflow_name,
@@ -1683,41 +1681,52 @@ def run_pipeline(payload: dict):
     except Exception as e:
         raise HTTPException(500, f"File generation failed: {str(e)}\n{traceback.format_exc()}")
 
-    # ── Write task files into tasks/ ──────────────────────────────────────
+    # ── Tulis file task ke {dag_id}/tasks/ ──────────────────────────────────
     written_task_files = []
+    write_failed = False
     for filename, content in task_files:
-        task_path = Path(DAGS_FOLDER) / "tasks" / filename
+        task_path = tasks_dir / filename
         try:
             task_path.write_text(content, encoding="utf-8")
             written_task_files.append(str(task_path))
             print(f"[DAG] Task file written: {task_path}")
         except Exception as e:
+            write_failed = True
             print(f"[DAG] Warning: could not write {task_path}: {e}")
 
-    # ── Write the workflow DAG file ───────────────────────────────────────
-    dag_path = Path(DAGS_FOLDER) / f"dag_{dag_id}.py"
+    # ── Tulis file DAG utama ke {dag_id}/{dag_id}.py ────────────────────────
+    dag_path = workflow_dir / f"{dag_id}.py"
     try:
         dag_path.write_text(dag_content, encoding="utf-8")
-        print(f"[DAG] Workflow DAG written: {dag_path}")
+        print(f"[DAG] Written: {dag_path}")
     except Exception as e:
+        # Fallback: tulis ke /tmp dengan struktur folder yang sama
         try:
-            fallback = Path("/tmp") / f"dag_{dag_id}.py"
-            fallback.write_text(dag_content, encoding="utf-8")
-            print(f"[DAG] Fallback written: {fallback}")
+            fallback_dir   = Path("/tmp") / dag_id
+            fallback_tasks = fallback_dir / "tasks"
+            os.makedirs(fallback_tasks, exist_ok=True)
+            (fallback_tasks / "__init__.py").write_text("# Auto-generated\n")
+
+            for filename, content in task_files:
+                (fallback_tasks / filename).write_text(content, encoding="utf-8")
+
+            fallback_dag = fallback_dir / f"{dag_id}.py"
+            fallback_dag.write_text(dag_content, encoding="utf-8")
+            print(f"[DAG] Fallback written to: {fallback_dag}")
+            dag_path = fallback_dag
         except Exception as e2:
             raise HTTPException(500, f"Failed to write DAG file: {e}. Fallback also failed: {e2}")
 
-    # ── Save pipeline run records ─────────────────────────────────────────
+    # ── Simpan record pipeline_runs ──────────────────────────────────────────
     conn = get_conn()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     run_ids = []
     try:
         ensure_pipeline_runs_table(cur, conn)
         for task in tasks:
-            task_id = task.get("task_id", "task_1")
+            task_id    = task.get("task_id", "task_1")
             depends_on = task.get("depends_on", [])
 
-            # RESOLUSI INPUT TABLE SAMA SEPERTI DI GENERATOR
             if task.get("input_table"):
                 raw_task_input = task["input_table"]
             elif depends_on:
@@ -1728,8 +1737,9 @@ def run_pipeline(payload: dict):
 
             safe_task_input = re.sub(r'[^a-zA-Z0-9_.]', '', raw_task_input) if raw_task_input else ""
 
-            safe_out = re.sub(r'[^a-z0-9_]', '_', task.get("output_name","output").lower())
-            if safe_out and safe_out[0].isdigit(): safe_out = 't_' + safe_out
+            safe_out = re.sub(r'[^a-z0-9_]', '_', task.get("output_name", "output").lower())
+            if safe_out and safe_out[0].isdigit():
+                safe_out = 't_' + safe_out
             safe_out = safe_out or 'output'
 
             cur.execute("""
@@ -1746,9 +1756,9 @@ def run_pipeline(payload: dict):
     finally:
         cur.close(); conn.close()
 
-    # ── Wait for Airflow to detect the DAG ───────────────────────────────
+    # ── Tunggu Airflow mendeteksi DAG baru ──────────────────────────────────
     if not dag_exists:
-        print(f"[DAG] Waiting for Airflow to detect dag_{dag_id}…")
+        print(f"[DAG] Waiting for Airflow to detect {dag_id}…")
         detected = False
         for i in range(30):
             time.sleep(1)
@@ -1758,13 +1768,14 @@ def run_pipeline(payload: dict):
                     print(f"[DAG] Detected after {i+1}s")
                     detected = True
                     break
-            except: pass
+            except:
+                pass
         if not detected:
             print(f"[DAG] Warning: DAG not detected after 30s. Will try to trigger anyway.")
     else:
         time.sleep(1)
 
-    # ── Unpause and trigger ───────────────────────────────────────────────
+    # ── Unpause + trigger DAG ────────────────────────────────────────────────
     try:
         requests.patch(
             f"{AIRFLOW_URL}/api/v1/dags/{dag_id}", auth=AIRFLOW_AUTH,
@@ -1789,14 +1800,15 @@ def run_pipeline(payload: dict):
         print(f"[DAG] Trigger warning: {e}")
 
     return {
-        "run_ids":          run_ids,
-        "run_id":           run_ids[0] if run_ids else None,
-        "dag_id":           dag_id,
-        "dag_file":         f"dag_{dag_id}.py",
-        "task_files":       [f"tasks/{fn}" for fn, _ in task_files],
-        "dag_run":          dag_run,
-        "status":           "triggered",
-        "is_new":           not dag_exists,
+        "run_ids":    run_ids,
+        "run_id":     run_ids[0] if run_ids else None,
+        "dag_id":     dag_id,
+        "workflow_folder": str(workflow_dir),
+        "dag_file":   f"{dag_id}/{dag_id}.py",
+        "task_files": [f"{dag_id}/tasks/{fn}" for fn, _ in task_files],
+        "dag_run":    dag_run,
+        "status":     "triggered",
+        "is_new":     not dag_exists,
     }
 
 
@@ -1925,9 +1937,11 @@ def get_dag_status(run_id: int):
 
 @app.get("/api/pipelines/dag-files/{dag_id}")
 def list_dag_files(dag_id: str):
-    """Return the list of generated files for a given DAG (workflow + tasks)."""
+    """Return the list of generated files for a given workflow (DAG + tasks)."""
+    workflow_dir = Path(DAGS_FOLDER) / dag_id
     files = []
-    dag_file = Path(DAGS_FOLDER) / f"dag_{dag_id}.py"
+
+    dag_file = workflow_dir / f"{dag_id}.py"
     if dag_file.exists():
         files.append({
             "role":     "workflow_dag",
@@ -1935,23 +1949,21 @@ def list_dag_files(dag_id: str):
             "path":     str(dag_file),
             "size":     dag_file.stat().st_size,
         })
-    tasks_dir = Path(DAGS_FOLDER) / "tasks"
+
+    tasks_dir = workflow_dir / "tasks"
     if tasks_dir.exists():
         for tf in sorted(tasks_dir.glob("task_*.py")):
-            # Check if this task file belongs to this DAG by reading the DAG_ID line
-            try:
-                header = tf.read_text(encoding="utf-8")[:500]
-                if f"DAG ID    : {dag_id}" in header or f"DAG_ID      = '{dag_id}'" in header:
-                    files.append({
-                        "role":     "task",
-                        "filename": tf.name,
-                        "path":     str(tf),
-                        "size":     tf.stat().st_size,
-                    })
-            except Exception:
-                pass
-    return {"dag_id": dag_id, "files": files}
+            files.append({
+                "role":     "task",
+                "filename": tf.name,
+                "path":     str(tf),
+                "size":     tf.stat().st_size,
+            })
 
+    if not files:
+        raise HTTPException(404, f"No files found for workflow '{dag_id}'")
+
+    return {"dag_id": dag_id, "workflow_folder": str(workflow_dir), "files": files}
 
 # ════════════════════════════════════════════════════════════════════════════
 # TRANSFORM PREVIEW (DuckDB-powered)
@@ -2040,6 +2052,46 @@ def preview_transform(payload: dict):
     except Exception as e: raise HTTPException(400, f"Preview failed: {e}")
     finally: cur.close(); conn.close()
 
+@app.post("/api/preview/spark-pipeline")
+def preview_spark_pipeline(payload: dict):
+    """
+    Preview hasil node (utility atau output) SEBELUM Run Pipeline dijalankan.
+    Menggunakan Spark + shared-node caching + broadcast join + dynamic config.
+    """
+    nodes          = payload.get("nodes", [])
+    edges          = payload.get("edges", [])
+    target_node_id = payload.get("target_node_id")
+    limit          = int(payload.get("limit", 100))
+
+    if not target_node_id:
+        raise HTTPException(400, "target_node_id required")
+
+    input_node = next((n for n in nodes if n.get("data", {}).get("type") == "input_dataset"), None)
+    if not input_node or not input_node.get("data", {}).get("config", {}).get("dataset"):
+        raise HTTPException(400, "Configure the Input Dataset node first")
+
+    ds = input_node["data"]["config"]["dataset"]
+    table_name = ds.get("table_name") or re.sub(r'\.[^.]+$', '', ds.get("name", "")).lower().replace(" ", "_")
+    input_table = f'staging."{table_name}"'
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0", (input_table,))
+        size_mb = float(cur.fetchone()[0] or 0)
+    except Exception:
+        size_mb = (ds.get("file_size_bytes") or 0) / (1024 * 1024) or 100
+    finally:
+        cur.close(); conn.close()
+
+    try:
+        return spark_engine.preview_pipeline_spark(
+            input_table=input_table, size_mb=size_mb,
+            nodes=nodes, edges=edges,
+            target_node_id=target_node_id, limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Spark preview failed: {e}\n{traceback.format_exc()}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # TRANSFORM PREVIEW (DuckDB-powered, instant)
