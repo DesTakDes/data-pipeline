@@ -377,7 +377,21 @@ function buildTransformChain(targetNodeId, nodes, edges) {
     const node = nodes.find(n => n.id === current);
     if (!node) break;
     if (node.data.type !== "input_dataset") {
-      path.unshift({ type: node.data.type, config: node.data.config || {} });
+      let config = node.data.config || {};
+
+      // FIX: resolve rightNodeId -> nama tabel staging aktual,
+      // karena task file di backend tidak punya akses ke graph nodes.
+      if (node.data.type === "join_data" && config.rightNodeId) {
+        const rightNode = nodes.find(n => n.id === config.rightNodeId);
+        const rightDs   = rightNode?.data?.config?.dataset;
+        if (rightDs) {
+          const rightTable = rightDs.table_name
+            || rightDs.name.replace(/\.[^.]+$/, "").toLowerCase().replace(/[\s-]+/g, "_");
+          config = { ...config, rightTable: `staging.${rightTable}` };
+        }
+      }
+
+      path.unshift({ type: node.data.type, config });
     }
     const sourceEdge = edges.find(e => e.target === current);
     current = sourceEdge?.source;

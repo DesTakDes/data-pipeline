@@ -126,7 +126,10 @@ def _duckdb_available() -> bool:
         return False
 
 
-def _build_duckdb_sql(input_alias: str, transforms: list, limit: Optional[int] = None) -> str:
+def _build_duckdb_sql(input_alias: str, transforms: list, limit: Optional[int] = None,
+                       right_tables: Optional[dict] = None) -> str:
+    """Compile all transforms into a single DuckDB CTE chain SQL."""
+    right_tables = right_tables or {}
     cte_parts  = []
     step       = 0
     cur_alias  = input_alias
@@ -315,6 +318,42 @@ def _build_duckdb_sql(input_alias: str, transforms: list, limit: Optional[int] =
                     cur_cols = [c for c in cur_cols if c not in (selected if remove_orig else [])]
                     if new_col not in cur_cols:
                         cur_cols = cur_cols + [new_col]
+            elif ntype == "join_data":
+                right_table = config.get("rightTable", "")
+                left_col    = config.get("leftCol", "")
+                right_col   = config.get("rightCol", "")
+                r_info      = right_tables.get(right_table)
+
+                if not (right_table and left_col and r_info):
+                    step -= 1; continue
+
+                r_alias  = r_info["alias"]
+                r_cols   = r_info.get("columns", [])
+                raw_type = config.get("joinType", "INNER JOIN").upper()
+                is_cross = "CROSS" in raw_type
+                sql_join = "CROSS JOIN" if is_cross else raw_type
+
+                dup = [c for c in r_cols if cur_cols and c in cur_cols and c != right_col]
+                right_select = ", ".join(
+                    f'{r_alias}."{c}" AS "{c}_right"' if c in dup else f'{r_alias}."{c}"'
+                    for c in r_cols
+                ) if r_cols else f"{r_alias}.*"
+
+                select_clause = f"{cur_alias}.*, {right_select}"
+
+                if is_cross:
+                    cte_parts.append(
+                        f"{alias} AS (SELECT {select_clause} FROM {cur_alias} CROSS JOIN {r_alias})"
+                    )
+                elif right_col:
+                    cte_parts.append(
+                        f'{alias} AS (SELECT {select_clause} FROM {cur_alias} '
+                        f'{sql_join} {r_alias} ON {cur_alias}."{left_col}" = {r_alias}."{right_col}")'
+                    )
+                else:
+                    step -= 1; continue
+
+                cur_cols = None
             else:
                 step -= 1; continue
         except Exception as e:
@@ -796,6 +835,17 @@ def _run_duckdb(input_table, output_name, transforms, progress_cb=None):
         con.register("_input", df_input)
         upd(40, f"Data ready. Running {len(transforms)} transform(s)…")
 
+        right_tables = {}
+        for idx, tx in enumerate(transforms):
+            if tx.get("type") == "join_data":
+                r_table = (tx.get("config") or {}).get("rightTable")
+                if r_table and r_table not in right_tables:
+                    r_df = pd.read_sql(f"SELECT * FROM {r_table}", pg)
+                    r_alias = f"_right_{idx}"
+                    con.register(r_alias, r_df)
+                    right_tables[r_table] = {"alias": r_alias, "columns": list(r_df.columns)}
+                    upd(42, f"Loaded right table for join: {r_table} ({len(r_df):,} rows)")
+
         sql       = _build_transform_sql("_input", transforms)
         t_tx      = time.time()
         result_df = con.execute(sql).df()
@@ -883,6 +933,44 @@ def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
                     pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(gc)}, {ae} FROM {cur_from} GROUP BY {_q(gc)}")
                     cols=gc+[a["alias"] for a in ac]
                 else: tmp=cur_from; step-=1; continue
+            elif ntype == "join_data":
+                right_table = config.get("rightTable", "")
+                left_col    = config.get("leftCol", "")
+                right_col   = config.get("rightCol", "")
+                if not (right_table and left_col):
+                    tmp = cur_from; step -= 1; continue
+
+                raw_type = config.get("joinType", "INNER JOIN").upper()
+                is_cross = "CROSS" in raw_type
+                sql_join = raw_type if not is_cross else "CROSS JOIN"
+
+                schema_r, tname_r = right_table.split(".", 1) if "." in right_table else ("staging", right_table)
+                r_cols = [r[0] for r in pg_hook.get_records(f"""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema=\'{schema_r}\' AND table_name=\'{tname_r.strip(chr(34))}\'
+                    ORDER BY ordinal_position
+                """)]
+
+                dup = [c for c in r_cols if c in cols and c != right_col]
+                left_select  = ", ".join(f\'l."{c}"\' for c in cols)
+                right_select = ", ".join(
+                    f\'r."{c}" AS "{c}_right"\' if c in dup else f\'r."{c}"\'
+                    for c in r_cols
+                )
+
+                if is_cross:
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {left_select}, {right_select} FROM {cur_from} l CROSS JOIN {right_table} r")
+                elif right_col:
+                    pg_hook.run(
+                        f"CREATE TABLE {tmp} AS SELECT {left_select}, {right_select} "
+                        f'FROM {cur_from} l {sql_join} {right_table} r '
+                        f'ON l."{left_col}" = r."{right_col}"'
+                    )
+                else:
+                    tmp = cur_from; step -= 1; continue
+
+                cols = cols + [f"{c}_right" if c in dup else c for c in r_cols]
+
             else:
                 tmp=cur_from; step-=1; continue
         except Exception as e:
@@ -903,9 +991,11 @@ def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
 # ── Spark Runner ──────────────────────────────────────────────────────────────
 
 def _run_spark(input_table, output_name, transforms, row_count):
-    from pyspark.sql import SparkSession, functions as F
+    from pyspark.sql import SparkSession, functions as F, Window
+
     safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
     optimal_partitions = max(SHUFFLE_PARTITIONS, row_count // 100_000 + 1)
+    BROADCAST_MAX_MB = 200
 
     spark = (SparkSession.builder
         .appName(f"ETLFlow_{DAG_ID}_{TASK_ID}_{safe_out}")
@@ -918,47 +1008,317 @@ def _run_spark(input_table, output_name, transforms, row_count):
         .config("spark.sql.adaptive.coalescePartitions.enabled","true")
         .config("spark.sql.shuffle.partitions", str(optimal_partitions))
         .config("spark.default.parallelism", str(optimal_partitions))
+        .config("spark.sql.autoBroadcastJoinThreshold", str(BROADCAST_MAX_MB * 1024 * 1024))
         .getOrCreate())
 
-    JDBC = {"url":"jdbc:postgresql://postgres:5432/airflow",
-             "properties":{"user":"airflow","password":"airflow","driver":"org.postgresql.Driver"}}
-    df = spark.read.jdbc(url=JDBC["url"], table=f"(SELECT * FROM {input_table}) AS t",
-                         numPartitions=min(8, optimal_partitions), properties=JDBC["properties"])
-    for tx in transforms:
-        ntype = tx.get("type",""); cfg = tx.get("config") or {}
-        try:
-            if   ntype == "filter_rows": df=df.filter(cfg.get("formula","1=1"))
-            elif ntype == "select_col":
-                c=[x for x in cfg.get("columns",[]) if x in df.columns]
-                if c: df=df.select(c)
-            elif ntype == "drop_col": df=df.drop(*[c for c in cfg.get("columns",[]) if c in df.columns])
-            elif ntype == "rename_col":
-                for o,n in cfg.get("renames",{}).items():
-                    if o in df.columns: df=df.withColumnRenamed(o,n)
-            elif ntype == "add_const": df=df.withColumn(cfg.get("name","c"),F.lit(cfg.get("value","")))
-            elif ntype == "group_agg":
-                gc=cfg.get("groupCols",[]); ac=cfg.get("aggCols",[])
-                if gc and ac:
-                    fn_map={"COUNT":F.count,"SUM":F.sum,"AVG":F.avg,"MIN":F.min,"MAX":F.max,"COUNT DISTINCT":F.countDistinct}
-                    df=df.groupBy(gc).agg(*[fn_map.get(a["func"],F.count)(a["col"]).alias(a["alias"]) for a in ac])
-            elif ntype == "pyspark":
-                code=cfg.get("code","")
-                if code:
-                    ns={"df":df,"spark":spark,"F":F}; exec(code,ns); df=ns["df"]
-        except Exception as e:
-            print(f"[Spark] {ntype}: {e}")
+    TYPE_MAP = _resolve_types_spark_map()
 
-    df.write.jdbc(url=JDBC["url"], table=f"warehouse.{safe_out}", mode="overwrite", properties=JDBC["properties"])
+    # GANTI: dulu spark.read.jdbc(numPartitions=...) tanpa partitionColumn
+    # -> Spark abaikan numPartitions, baca cuma 1 partisi.
+    # Sekarang pakai _read_jdbc_table() yang benar-benar paralel.
+    df = _read_jdbc_table(spark, input_table, num_partitions=min(8, optimal_partitions))
+
+    for tx in transforms:
+        ntype = tx.get("type","")
+        cfg   = tx.get("config") or {}
+        try:
+            if ntype == "filter_rows":
+                df = df.filter(F.expr(cfg.get("formula", "1=1")))
+
+            elif ntype == "select_col":
+                c = [x for x in cfg.get("columns", []) if x in df.columns]
+                if c:
+                    df = df.select(*c)
+
+            elif ntype == "drop_col":
+                drop = [c for c in cfg.get("columns", []) if c in df.columns]
+                if drop:
+                    df = df.drop(*drop)
+
+            elif ntype == "rename_col":
+                for o, n in cfg.get("renames", {}).items():
+                    if o in df.columns:
+                        df = df.withColumnRenamed(o, n)
+
+            elif ntype == "add_const":
+                # GANTI: dulu F.lit(value) tanpa cast -> selalu jadi string.
+                # Sekarang cast sesuai dtype yang dipilih user di UI.
+                name  = cfg.get("name", "new_col")
+                val   = cfg.get("value", "")
+                dtype = TYPE_MAP.get(cfg.get("dtype", "TEXT"), "string")
+                df = df.withColumn(name, F.lit(val).cast(dtype))
+
+            # ── BARU: node yang sebelumnya tidak ditangani sama sekali ──
+            elif ntype == "set_val":
+                target = cfg.get("targetCol")
+                if target:
+                    if cfg.get("useExpr"):
+                        df = df.withColumn(target, F.expr(cfg.get("expr", target)))
+                    else:
+                        src = cfg.get("sourceCol", target)
+                        if src in df.columns:
+                            df = df.withColumn(target, F.col(src))
+
+            elif ntype == "val_mapper":
+                src, new_col = cfg.get("sourceCol"), cfg.get("newColName", "mapped")
+                whens, else_v = cfg.get("whens", []), cfg.get("elseValue", "")
+                if src and src in df.columns:
+                    expr = None
+                    for w in whens:
+                        condition = w.get("condition", "=")
+                        value     = w.get("value", "")
+                        result    = w.get("result", "")
+                        if condition not in ("IS NULL", "IS NOT NULL") and not value:
+                            continue
+                        try:
+                            cond_expr = _spark_when_condition(F, src, condition, value)
+                        except Exception:
+                            continue
+                        expr = (F.when(cond_expr, F.lit(result)) if expr is None
+                                 else expr.when(cond_expr, F.lit(result)))
+                    df = df.withColumn(new_col, expr.otherwise(F.lit(else_v)) if expr is not None else F.lit(else_v))
+
+            elif ntype == "fill_null":
+                fc = [c for c in cfg.get("columns", []) if c in df.columns]
+                ft = cfg.get("fillType", "value")
+                fv = cfg.get("fillValue", "")
+                if fc:
+                    if ft == "value":
+                        df = df.fillna(fv, subset=fc)
+                    elif ft == "mean":
+                        stats = df.select([F.mean(F.col(c)).alias(c) for c in fc]).collect()[0].asDict()
+                        stats = {k: v for k, v in stats.items() if v is not None}
+                        if stats: df = df.fillna(stats)
+                    elif ft == "median":
+                        meds = {}
+                        for c in fc:
+                            q = df.approxQuantile(c, [0.5], 0.001)
+                            if q: meds[c] = q[0]
+                        if meds: df = df.fillna(meds)
+                    elif ft == "mode":
+                        modes = {}
+                        for c in fc:
+                            row = (df.filter(F.col(c).isNotNull()).groupBy(c).count()
+                                     .orderBy(F.desc("count")).limit(1).collect())
+                            if row: modes[c] = row[0][c]
+                        if modes: df = df.fillna(modes)
+                    elif ft in ("forward", "backward"):
+                        df = df.withColumn("_rn", F.monotonically_increasing_id())
+                        if ft == "forward":
+                            win = Window.orderBy("_rn").rowsBetween(Window.unboundedPreceding, 0)
+                            fn = F.last
+                        else:
+                            win = Window.orderBy("_rn").rowsBetween(0, Window.unboundedFollowing)
+                            fn = F.first
+                        for c in fc:
+                            df = df.withColumn(c, fn(F.col(c), ignorenulls=True).over(win))
+                        df = df.drop("_rn")
+
+            elif ntype == "order_table":
+                orders = cfg.get("orders", [])
+                cols = [F.col(o["col"]).asc() if o.get("dir","ASC")=="ASC" else F.col(o["col"]).desc()
+                        for o in orders if o.get("col") in df.columns]
+                if cols:
+                    df = df.orderBy(*cols)
+
+            elif ntype == 'join_data':
+                right_table = config.get('rightTable', '')
+                left_col    = config.get('leftCol', '')
+                right_col   = config.get('rightCol', '')
+                r_info      = right_tables.get(right_table)
+
+                if not (right_table and left_col and r_info):
+                    step -= 1; continue
+
+                r_alias  = r_info['alias']
+                r_cols   = r_info.get('columns', [])
+                raw_type = config.get('joinType', 'INNER JOIN').upper()
+                is_cross = 'CROSS' in raw_type
+                sql_join = 'CROSS JOIN' if is_cross else raw_type.replace(
+                    'FULL OUTER JOIN', 'FULL OUTER JOIN'
+                )
+
+                # Bangun select list eksplisit agar kolom yang bentrok
+                # antara kiri & kanan tidak jadi ambiguous.
+                left_select = f'{cur_alias}.*'
+                if cur_cols:
+                    dup = [c for c in r_cols if c in cur_cols and c != right_col]
+                else:
+                    dup = [c for c in r_cols if c != right_col]  # asumsi konservatif
+                if dup:
+                    right_select_parts = ", ".join(
+                        f'{r_alias}."{c}" AS "{c}_right"' if c in dup else f'{r_alias}."{c}"'
+                        for c in r_cols
+                    )
+                else:
+                    right_select_parts = f'{r_alias}.*'
+
+                select_clause = f'{left_select}, {right_select_parts}'
+
+                if is_cross:
+                    cte_parts.append(
+                        f'{alias} AS (SELECT {select_clause} FROM {cur_alias} CROSS JOIN {r_alias})'
+                    )
+                elif right_col:
+                    cte_parts.append(
+                        f'{alias} AS (SELECT {select_clause} FROM {cur_alias} '
+                        f'{sql_join} {r_alias} ON {cur_alias}."{left_col}" = {r_alias}."{right_col}")'
+                    )
+                else:
+                    step -= 1; continue
+
+                cur_cols = None  # kolom berubah signifikan, reset tracking
+
+            else:
+                step -= 1; continue
+        except Exception as e:
+            print(f"[SQL Builder] {ntype} error: {e}")
+            step -= 1; continue
+        cur_alias = alias
+
+    lc = f" LIMIT {limit}" if limit else ""
+    if cte_parts:
+        return f"WITH {', '.join(cte_parts)} SELECT * FROM {cur_alias}{lc}"
+    return f"SELECT * FROM {input_alias}{lc}"
+
+            elif ntype == "calc":
+                new_col = (cfg.get("newColName") or "result").strip()
+                col_a, col_b, op = cfg.get("colA"), cfg.get("colB"), cfg.get("operation", "+")
+                if new_col and col_a in df.columns and col_b in df.columns:
+                    a, b = F.col(col_a).cast("double"), F.col(col_b).cast("double")
+                    expr = {"+": a+b, "-": a-b, "*": a*b, "/": F.when(b != 0, a/b)}.get(op, a+b)
+                    df = df.withColumn(new_col, expr)
+
+            elif ntype == "adv_calculator":
+                SCI = {"sin":F.sin,"cos":F.cos,"sqrt":F.sqrt,"radians":F.radians,
+                       "atan2":F.atan2,"power":F.pow}
+                for calc in cfg.get("calculations", []):
+                    fn    = SCI.get(calc.get("operation","sin"), F.sin)
+                    new_c = (calc.get("newColName") or "").strip()
+                    col_a, col_b = calc.get("colA"), calc.get("colB")
+                    if not new_c or col_a not in df.columns:
+                        continue
+                    if calc.get("operation") in ("atan2","power") and col_b in df.columns:
+                        df = df.withColumn(new_c, fn(F.col(col_a).cast("double"), F.col(col_b).cast("double")))
+                    else:
+                        df = df.withColumn(new_c, fn(F.col(col_a).cast("double")))
+
+            elif ntype == "combine_cols":
+                new_col, sep = (cfg.get("newColName") or "combined").strip(), cfg.get("separator", " ")
+                selected = [c for c in cfg.get("selectedCols", []) if c in df.columns]
+                remove_orig = cfg.get("removeOriginal", False)
+                if new_col and selected:
+                    parts = [F.coalesce(F.col(c).cast("string"), F.lit("")) for c in selected]
+                    combined = parts[0]
+                    for p in parts[1:]:
+                        combined = F.concat(combined, F.lit(sep), p)
+                    df = df.withColumn(new_col, combined)
+                    if remove_orig:
+                        df = df.drop(*selected)
+
+            elif ntype == "change_type":
+                for col, dtype in (cfg.get("types") or {}).items():
+                    if col in df.columns:
+                        df = df.withColumn(col, F.col(col).cast(TYPE_MAP.get(dtype, "string")))
+
+            elif ntype == "group_agg":
+                gc = [c for c in cfg.get("groupCols", []) if c in df.columns]
+                ac = cfg.get("aggCols", [])
+                if gc and ac:
+                    fn_map = {"COUNT":F.count,"SUM":F.sum,"AVG":F.avg,"MIN":F.min,
+                              "MAX":F.max,"COUNT DISTINCT":F.countDistinct}
+                    aggs = [fn_map.get(a["func"],F.count)(a["col"]).alias(a["alias"])
+                            for a in ac if a.get("col") in df.columns]
+                    if aggs:
+                        df = df.groupBy(*gc).agg(*aggs)
+
+            elif ntype == "pyspark":
+                code = cfg.get("code", "")
+                if code:
+                    ns = {"df": df, "spark": spark, "F": F}
+                    exec(code, ns)
+                    df = ns.get("df", df)
+
+        except Exception as e:
+            print(f"[Spark] {ntype} error: {e} — dilewati")
+
+    df.write.jdbc(url="jdbc:postgresql://postgres:5432/airflow",
+                  table=f"warehouse.{safe_out}", mode="overwrite",
+                  properties={"user":"airflow","password":"airflow","driver":"org.postgresql.Driver"})
 
     if row_count > 10_000:
         os.makedirs(PARQUET_DIR, exist_ok=True)
         parquet_path = f"{PARQUET_DIR}/{safe_out}.parquet"
         output_parts = max(1, row_count // 500_000)
-        (df.coalesce(output_parts).write.mode("overwrite").option("compression","snappy").parquet(parquet_path))
+        (df.coalesce(output_parts).write.mode("overwrite")
+           .option("compression","snappy").parquet(parquet_path))
         print(f"[Spark] Snappy Parquet saved: {parquet_path}")
 
     spark.stop()
 
+def _resolve_types_spark_map():
+    return {
+        'TEXT': 'string', 'INTEGER': 'int', 'BIGINT': 'bigint',
+        'NUMERIC': 'double', 'BOOLEAN': 'boolean',
+        'DATE': 'date', 'TIMESTAMP': 'timestamp', 'VARCHAR(255)': 'string',
+    }
+
+
+def _spark_when_condition(F, col, condition, value):
+    """Bangun kondisi Spark untuk semua jenis condition di val_mapper."""
+    c = F.col(col)
+    if condition == '=':
+        return c == value
+    if condition == '!=':
+        return c != value
+    if condition in ('>', '>=', '<', '<='):
+        num = float(value)
+        c_num = c.cast('double')
+        return {'>': c_num > num, '>=': c_num >= num,
+                '<': c_num < num, '<=': c_num <= num}[condition]
+    if condition == 'LIKE':
+        return c.like(value)
+    if condition == 'IS NULL':
+        return c.isNull()
+    if condition == 'IS NOT NULL':
+        return c.isNotNull()
+    if condition == 'IN':
+        vals = [v.strip() for v in str(value).split(',')]
+        return c.isin(*vals)
+    if condition == 'NOT IN':
+        vals = [v.strip() for v in str(value).split(',')]
+        return ~c.isin(*vals)
+    return c == value
+
+
+def _read_jdbc_table(spark, table, num_partitions=8):
+    """
+    Baca tabel Postgres via JDBC dengan partisi PARALEL.
+    Tanpa partitionColumn/lowerBound/upperBound, numPartitions
+    diabaikan Spark dan baca cuma jalan di 1 partisi.
+    """
+    JDBC_URL = "jdbc:postgresql://postgres:5432/airflow"
+    PROPS    = {"user": "airflow", "password": "airflow", "driver": "org.postgresql.Driver"}
+
+    wrapped = f"(SELECT *, ROW_NUMBER() OVER () AS _partition_key FROM {table}) AS t"
+    try:
+        return (spark.read.format("jdbc")
+                .option("url", JDBC_URL)
+                .option("dbtable", wrapped)
+                .option("partitionColumn", "_partition_key")
+                .option("lowerBound", "1")
+                .option("upperBound", "100000000")
+                .option("numPartitions", str(num_partitions))
+                .options(**PROPS)
+                .load()
+                .drop("_partition_key"))
+    except Exception as e:
+        print(f"[Spark] Partitioned read gagal ({e}), fallback ke single-partition read")
+        return (spark.read.format("jdbc")
+                .option("url", JDBC_URL)
+                .option("dbtable", f"(SELECT * FROM {table}) AS t")
+                .options(**PROPS)
+                .load())
 
 # ── Main Entry Point (called by the workflow DAG) ─────────────────────────────
 
@@ -2009,92 +2369,6 @@ def list_dag_files(dag_id: str):
 
     return {"dag_id": dag_id, "workflow_folder": str(workflow_dir), "files": files}
 
-# ════════════════════════════════════════════════════════════════════════════
-# TRANSFORM PREVIEW (DuckDB-powered)
-# ════════════════════════════════════════════════════════════════════════════
-
-@app.post("/api/preview/transform")
-def preview_transform(payload: dict):
-    dataset_id = payload.get("dataset_id")
-    transforms = payload.get("transforms", [])
-    limit      = payload.get("limit", 50)
-    if not dataset_id: raise HTTPException(400, "dataset_id required")
-
-    conn = get_conn()
-    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute("SELECT * FROM meta.datasets WHERE id = %s", (dataset_id,))
-        ds = cur.fetchone()
-        if not ds: raise HTTPException(404, "Dataset not found")
-        table_name = ds["table_name"]
-        tbl        = f'staging."{table_name}"'
-
-        if _duckdb_available():
-            import duckdb
-            sample_df = pd.read_sql(f"SELECT * FROM {tbl} LIMIT 100000", conn)
-            dcon      = duckdb.connect(":memory:")
-            dcon.register("_input", sample_df)
-            sql    = _build_duckdb_sql("_input", transforms, limit=limit)
-            result = dcon.execute(sql).df()
-            dcon.close()
-            return {"columns": list(result.columns), "rows": result.to_dict(orient="records")}
-
-        # PostgreSQL fallback
-        schema_cur = conn.cursor()
-        schema_cur.execute(f"""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema='staging' AND table_name='{table_name}'
-            ORDER BY ordinal_position
-        """)
-        cur_cols  = [r[0] for r in schema_cur.fetchall()]
-        current   = tbl
-        cte_parts = []
-        step      = 0
-
-        for tx in transforms:
-            ntype  = tx.get("type",""); config = tx.get("config") or {}
-            step  += 1; alias = f"step_{step}"
-            prev   = f"step_{step-1}" if step > 1 else current
-            try:
-                if ntype == "filter_rows":
-                    cte_parts.append(f"{alias} AS (SELECT * FROM {prev} WHERE {config.get('formula','1=1')})")
-                elif ntype == "select_col":
-                    cols = [c for c in config.get("columns", cur_cols) if c in cur_cols]
-                    if cols:
-                        cte_parts.append(f"{alias} AS (SELECT {_q(cols)} FROM {prev})")
-                        cur_cols = cols
-                    else: step -= 1; continue
-                elif ntype == "drop_col":
-                    keep = [c for c in cur_cols if c not in set(config.get("columns",[]))]
-                    cte_parts.append(f"{alias} AS (SELECT {_q(keep)} FROM {prev})")
-                    cur_cols = keep
-                elif ntype == "rename_col":
-                    rn   = config.get("renames",{})
-                    ex   = ", ".join(f'"{c}" AS "{rn.get(c,c)}"' for c in cur_cols)
-                    cte_parts.append(f"{alias} AS (SELECT {ex} FROM {prev})")
-                    cur_cols = [rn.get(c,c) for c in cur_cols]
-                elif ntype == "group_agg":
-                    gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
-                    if gc and ac:
-                        ae=", ".join(f'{a["func"]}("{a["col"]}") AS "{a["alias"]}"' for a in ac)
-                        cte_parts.append(f"{alias} AS (SELECT {_q(gc)}, {ae} FROM {prev} GROUP BY {_q(gc)})")
-                        cur_cols = gc + [a["alias"] for a in ac]
-                    else: step -= 1; continue
-                else: step -= 1; continue
-            except Exception as e:
-                cte_parts.append(f"{alias} AS (SELECT * FROM {prev})")
-
-        last = f"step_{step}" if cte_parts else current
-        sql  = (f"WITH {', '.join(cte_parts)} SELECT * FROM {last} LIMIT {limit}"
-                if cte_parts else f"SELECT * FROM {current} LIMIT {limit}")
-        cur.execute(sql)
-        rows    = cur.fetchall()
-        columns = [d[0] for d in cur.description]
-        return {"columns": columns, "rows": [dict(r) for r in rows]}
-
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(400, f"Preview failed: {e}")
-    finally: cur.close(); conn.close()
 
 @app.post("/api/preview/spark-pipeline")
 def preview_spark_pipeline(payload: dict):
@@ -2143,9 +2417,7 @@ def preview_spark_pipeline(payload: dict):
 
 @app.post("/api/preview/transform")
 def preview_transform(payload: dict):
-    """
-    Preview hasil transform — menggunakan DuckDB jika tersedia (jauh lebih cepat).
-    """
+    """Preview transform result — uses DuckDB if available (much faster)."""
     dataset_id = payload.get("dataset_id")
     transforms = payload.get("transforms", [])
     limit      = payload.get("limit", 50)
@@ -2160,20 +2432,28 @@ def preview_transform(payload: dict):
         table_name = ds["table_name"]
         tbl        = f'staging."{table_name}"'
 
-        # ── DuckDB path (cepat) ───────────────────────────────────────────
         if _duckdb_available():
             import duckdb
-            # Baca sample (max 100K rows untuk preview)
-            sample_df = pd.read_sql(f"SELECT * FROM {tbl} LIMIT 100000", conn)
+            sample_df = pd.read_sql(f"SELECT * FROM {tbl} LIMIT 5000", conn)
             dcon      = duckdb.connect(":memory:")
             dcon.register("_input", sample_df)
-            sql    = _build_duckdb_sql("_input", transforms, limit=limit)
+
+            # ── Baca & register tabel kanan untuk join_data ──────────────
+            right_tables = {}
+            for idx, tx in enumerate(transforms):
+                if tx.get("type") == "join_data":
+                    r_table = (tx.get("config") or {}).get("rightTable")
+                    if r_table and r_table not in right_tables:
+                        r_df = pd.read_sql(f"SELECT * FROM {r_table} LIMIT 5000", conn)
+                        r_alias = f"_right_{idx}"
+                        dcon.register(r_alias, r_df)
+                        right_tables[r_table] = {"alias": r_alias, "columns": list(r_df.columns)}
+
+            sql    = _build_duckdb_sql("_input", transforms, limit=limit, right_tables=right_tables)
             result = dcon.execute(sql).df()
             dcon.close()
             return {"columns": list(result.columns), "rows": result.to_dict(orient="records")}
-
-        # ── PostgreSQL CTE fallback ───────────────────────────────────────
-        schema_cur = conn.cursor()
+            schema_cur = conn.cursor()
         schema_cur.execute(f"""
             SELECT column_name FROM information_schema.columns
             WHERE table_schema='staging' AND table_name='{table_name}'
@@ -2206,17 +2486,6 @@ def preview_transform(payload: dict):
                     ex   = ", ".join(f'"{c}" AS "{rn.get(c,c)}"' for c in cur_cols)
                     cte_parts.append(f"{alias} AS (SELECT {ex} FROM {prev})")
                     cur_cols = [rn.get(c,c) for c in cur_cols]
-                elif ntype == "add_const":
-                    n=config.get("name","c"); v=config.get("value",""); dt=config.get("dtype","TEXT")
-                    cte_parts.append(f'{alias} AS (SELECT {_q(cur_cols)}, CAST({repr(v)} AS {dt}) AS "{n}" FROM {prev})')
-                    cur_cols = cur_cols + [n]
-                elif ntype == "fill_null":
-                    fc=config.get("columns",[]); fv=config.get("fillValue","")
-                    ex=", ".join(f"COALESCE(\"{c}\"::TEXT,{repr(str(fv))})::TEXT AS \"{c}\"" if c in fc else f'"{c}"' for c in cur_cols)
-                    cte_parts.append(f"{alias} AS (SELECT {ex} FROM {prev})")
-                elif ntype == "order_table":
-                    oc=", ".join(f'"{o["col"]}" {o.get("dir","ASC")}' for o in config.get("orders",[]) if o.get("col") in cur_cols) or "1"
-                    cte_parts.append(f"{alias} AS (SELECT {_q(cur_cols)} FROM {prev} ORDER BY {oc})")
                 elif ntype == "group_agg":
                     gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
                     if gc and ac:
@@ -2224,6 +2493,50 @@ def preview_transform(payload: dict):
                         cte_parts.append(f"{alias} AS (SELECT {_q(gc)}, {ae} FROM {prev} GROUP BY {_q(gc)})")
                         cur_cols = gc + [a["alias"] for a in ac]
                     else: step -= 1; continue
+
+                elif ntype == "join_data":
+                    right_table = config.get("rightTable", "")
+                    left_col    = config.get("leftCol", "")
+                    right_col   = config.get("rightCol", "")
+                    if not (right_table and left_col):
+                        step -= 1; continue
+
+                    schema_r, tname_r = right_table.split(".", 1) if "." in right_table else ("staging", right_table)
+                    tname_r_clean = tname_r.strip('"')
+                    r_cur = conn.cursor()
+                    r_cur.execute("""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_schema = %s AND table_name = %s
+                        ORDER BY ordinal_position
+                    """, (schema_r, tname_r_clean))
+                    r_cols = [r[0] for r in r_cur.fetchall()]
+                    r_cur.close()
+
+                    raw_type = config.get("joinType", "INNER JOIN").upper()
+                    is_cross = "CROSS" in raw_type
+                    sql_join = "CROSS JOIN" if is_cross else raw_type
+
+                    dup = [c for c in r_cols if c in cur_cols and c != right_col]
+                    left_select  = ", ".join(f'l."{c}"' for c in cur_cols)
+                    right_select = ", ".join(
+                        f'r."{c}" AS "{c}_right"' if c in dup else f'r."{c}"'
+                        for c in r_cols
+                    )
+
+                    if is_cross:
+                        cte_parts.append(
+                            f"{alias} AS (SELECT {left_select}, {right_select} FROM {prev} l CROSS JOIN {right_table} r)"
+                        )
+                    elif right_col:
+                        cte_parts.append(
+                            f'{alias} AS (SELECT {left_select}, {right_select} '
+                            f'FROM {prev} l {sql_join} {right_table} r ON l."{left_col}" = r."{right_col}")'
+                        )
+                    else:
+                        step -= 1; continue
+
+                    cur_cols = cur_cols + [f"{c}_right" if c in dup else c for c in r_cols]
+
                 else: step -= 1; continue
             except Exception as e:
                 cte_parts.append(f"{alias} AS (SELECT * FROM {prev})")
@@ -2239,7 +2552,6 @@ def preview_transform(payload: dict):
     except HTTPException: raise
     except Exception as e: raise HTTPException(400, f"Preview failed: {e}")
     finally: cur.close(); conn.close()
-
 
 # # ── DAG Generator (Spark-based) ──────────────────────────────────────
 # def generate_spark_dag(dag_id, workflow_id, workflow_name, input_table, tasks, description=""):
