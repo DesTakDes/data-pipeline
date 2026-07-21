@@ -1013,14 +1013,11 @@ def _run_spark(input_table, output_name, transforms, row_count):
 
     TYPE_MAP = _resolve_types_spark_map()
 
-    # GANTI: dulu spark.read.jdbc(numPartitions=...) tanpa partitionColumn
-    # -> Spark abaikan numPartitions, baca cuma 1 partisi.
-    # Sekarang pakai _read_jdbc_table() yang benar-benar paralel.
     df = _read_jdbc_table(spark, input_table, num_partitions=min(8, optimal_partitions))
 
     for tx in transforms:
-        ntype = tx.get("type","")
-        cfg   = tx.get("config") or {}
+        ntype = tx.get("type", "")
+        cfg = tx.get("config") or {}
         try:
             if ntype == "filter_rows":
                 df = df.filter(F.expr(cfg.get("formula", "1=1")))
@@ -1041,14 +1038,11 @@ def _run_spark(input_table, output_name, transforms, row_count):
                         df = df.withColumnRenamed(o, n)
 
             elif ntype == "add_const":
-                # GANTI: dulu F.lit(value) tanpa cast -> selalu jadi string.
-                # Sekarang cast sesuai dtype yang dipilih user di UI.
-                name  = cfg.get("name", "new_col")
-                val   = cfg.get("value", "")
+                name = cfg.get("name", "new_col")
+                val = cfg.get("value", "")
                 dtype = TYPE_MAP.get(cfg.get("dtype", "TEXT"), "string")
                 df = df.withColumn(name, F.lit(val).cast(dtype))
 
-            # ── BARU: node yang sebelumnya tidak ditangani sama sekali ──
             elif ntype == "set_val":
                 target = cfg.get("targetCol")
                 if target:
@@ -1060,23 +1054,30 @@ def _run_spark(input_table, output_name, transforms, row_count):
                             df = df.withColumn(target, F.col(src))
 
             elif ntype == "val_mapper":
-                src, new_col = cfg.get("sourceCol"), cfg.get("newColName", "mapped")
-                whens, else_v = cfg.get("whens", []), cfg.get("elseValue", "")
+                src = cfg.get("sourceCol")
+                new_col = cfg.get("newColName", "mapped")
+                whens = cfg.get("whens", [])
+                else_v = cfg.get("elseValue", "")
                 if src and src in df.columns:
                     expr = None
                     for w in whens:
                         condition = w.get("condition", "=")
-                        value     = w.get("value", "")
-                        result    = w.get("result", "")
+                        value = w.get("value", "")
+                        result = w.get("result", "")
                         if condition not in ("IS NULL", "IS NOT NULL") and not value:
                             continue
                         try:
                             cond_expr = _spark_when_condition(F, src, condition, value)
                         except Exception:
                             continue
-                        expr = (F.when(cond_expr, F.lit(result)) if expr is None
-                                 else expr.when(cond_expr, F.lit(result)))
-                    df = df.withColumn(new_col, expr.otherwise(F.lit(else_v)) if expr is not None else F.lit(else_v))
+                        if expr is None:
+                            expr = F.when(cond_expr, F.lit(result))
+                        else:
+                            expr = expr.when(cond_expr, F.lit(result))
+                    if expr is not None:
+                        df = df.withColumn(new_col, expr.otherwise(F.lit(else_v)))
+                    else:
+                        df = df.withColumn(new_col, F.lit(else_v))
 
             elif ntype == "fill_null":
                 fc = [c for c in cfg.get("columns", []) if c in df.columns]
@@ -1088,20 +1089,25 @@ def _run_spark(input_table, output_name, transforms, row_count):
                     elif ft == "mean":
                         stats = df.select([F.mean(F.col(c)).alias(c) for c in fc]).collect()[0].asDict()
                         stats = {k: v for k, v in stats.items() if v is not None}
-                        if stats: df = df.fillna(stats)
+                        if stats:
+                            df = df.fillna(stats)
                     elif ft == "median":
                         meds = {}
                         for c in fc:
                             q = df.approxQuantile(c, [0.5], 0.001)
-                            if q: meds[c] = q[0]
-                        if meds: df = df.fillna(meds)
+                            if q:
+                                meds[c] = q[0]
+                        if meds:
+                            df = df.fillna(meds)
                     elif ft == "mode":
                         modes = {}
                         for c in fc:
                             row = (df.filter(F.col(c).isNotNull()).groupBy(c).count()
                                      .orderBy(F.desc("count")).limit(1).collect())
-                            if row: modes[c] = row[0][c]
-                        if modes: df = df.fillna(modes)
+                            if row:
+                                modes[c] = row[0][c]
+                        if modes:
+                            df = df.fillna(modes)
                     elif ft in ("forward", "backward"):
                         df = df.withColumn("_rn", F.monotonically_increasing_id())
                         if ft == "forward":
@@ -1116,95 +1122,72 @@ def _run_spark(input_table, output_name, transforms, row_count):
 
             elif ntype == "order_table":
                 orders = cfg.get("orders", [])
-                cols = [F.col(o["col"]).asc() if o.get("dir","ASC")=="ASC" else F.col(o["col"]).desc()
-                        for o in orders if o.get("col") in df.columns]
+                cols = [
+                    F.col(o["col"]).asc() if o.get("dir", "ASC") == "ASC" else F.col(o["col"]).desc()
+                    for o in orders if o.get("col") in df.columns
+                ]
                 if cols:
                     df = df.orderBy(*cols)
 
-            elif ntype == 'join_data':
-                right_table = config.get('rightTable', '')
-                left_col    = config.get('leftCol', '')
-                right_col   = config.get('rightCol', '')
-                r_info      = right_tables.get(right_table)
+            elif ntype == "join_data":
+                right_table = cfg.get("rightTable")
+                left_col = cfg.get("leftCol")
+                right_col = cfg.get("rightCol")
+                if right_table and left_col:
+                    right_df = _read_jdbc_table(spark, right_table, num_partitions=4)
 
-                if not (right_table and left_col and r_info):
-                    step -= 1; continue
+                    raw_type = cfg.get("joinType", "INNER JOIN").upper()
+                    is_cross = "CROSS" in raw_type
+                    join_type = raw_type.replace(" JOIN", "").lower().replace("full outer", "outer")
 
-                r_alias  = r_info['alias']
-                r_cols   = r_info.get('columns', [])
-                raw_type = config.get('joinType', 'INNER JOIN').upper()
-                is_cross = 'CROSS' in raw_type
-                sql_join = 'CROSS JOIN' if is_cross else raw_type.replace(
-                    'FULL OUTER JOIN', 'FULL OUTER JOIN'
-                )
+                    dup_cols = [c for c in right_df.columns if c in df.columns and c != right_col]
+                    for c in dup_cols:
+                        right_df = right_df.withColumnRenamed(c, f"{c}_right")
 
-                # Bangun select list eksplisit agar kolom yang bentrok
-                # antara kiri & kanan tidak jadi ambiguous.
-                left_select = f'{cur_alias}.*'
-                if cur_cols:
-                    dup = [c for c in r_cols if c in cur_cols and c != right_col]
-                else:
-                    dup = [c for c in r_cols if c != right_col]  # asumsi konservatif
-                if dup:
-                    right_select_parts = ", ".join(
-                        f'{r_alias}."{c}" AS "{c}_right"' if c in dup else f'{r_alias}."{c}"'
-                        for c in r_cols
-                    )
-                else:
-                    right_select_parts = f'{r_alias}.*'
+                    try:
+                        right_size_mb = _estimate_mb(_get_conn(), right_table)
+                    except Exception:
+                        right_size_mb = 9999
+                    if right_size_mb <= BROADCAST_MAX_MB:
+                        right_df = F.broadcast(right_df)
+                        print(f"[Spark] join_data: broadcast tabel kanan (~{right_size_mb:.1f} MB)")
 
-                select_clause = f'{left_select}, {right_select_parts}'
-
-                if is_cross:
-                    cte_parts.append(
-                        f'{alias} AS (SELECT {select_clause} FROM {cur_alias} CROSS JOIN {r_alias})'
-                    )
-                elif right_col:
-                    cte_parts.append(
-                        f'{alias} AS (SELECT {select_clause} FROM {cur_alias} '
-                        f'{sql_join} {r_alias} ON {cur_alias}."{left_col}" = {r_alias}."{right_col}")'
-                    )
-                else:
-                    step -= 1; continue
-
-                cur_cols = None  # kolom berubah signifikan, reset tracking
-
-            else:
-                step -= 1; continue
-        except Exception as e:
-            print(f"[SQL Builder] {ntype} error: {e}")
-            step -= 1; continue
-        cur_alias = alias
-
-    lc = f" LIMIT {limit}" if limit else ""
-    if cte_parts:
-        return f"WITH {', '.join(cte_parts)} SELECT * FROM {cur_alias}{lc}"
-    return f"SELECT * FROM {input_alias}{lc}"
+                    if is_cross:
+                        df = df.crossJoin(right_df)
+                    elif right_col:
+                        df = df.join(right_df, df[left_col] == right_df[right_col], join_type)
 
             elif ntype == "calc":
                 new_col = (cfg.get("newColName") or "result").strip()
-                col_a, col_b, op = cfg.get("colA"), cfg.get("colB"), cfg.get("operation", "+")
+                col_a = cfg.get("colA")
+                col_b = cfg.get("colB")
+                op = cfg.get("operation", "+")
                 if new_col and col_a in df.columns and col_b in df.columns:
-                    a, b = F.col(col_a).cast("double"), F.col(col_b).cast("double")
-                    expr = {"+": a+b, "-": a-b, "*": a*b, "/": F.when(b != 0, a/b)}.get(op, a+b)
+                    a = F.col(col_a).cast("double")
+                    b = F.col(col_b).cast("double")
+                    expr = {"+": a + b, "-": a - b, "*": a * b, "/": F.when(b != 0, a / b)}.get(op, a + b)
                     df = df.withColumn(new_col, expr)
 
             elif ntype == "adv_calculator":
-                SCI = {"sin":F.sin,"cos":F.cos,"sqrt":F.sqrt,"radians":F.radians,
-                       "atan2":F.atan2,"power":F.pow}
+                SCI = {
+                    "sin": F.sin, "cos": F.cos, "sqrt": F.sqrt,
+                    "radians": F.radians, "atan2": F.atan2, "power": F.pow,
+                }
                 for calc in cfg.get("calculations", []):
-                    fn    = SCI.get(calc.get("operation","sin"), F.sin)
+                    fn = SCI.get(calc.get("operation", "sin"), F.sin)
                     new_c = (calc.get("newColName") or "").strip()
-                    col_a, col_b = calc.get("colA"), calc.get("colB")
+                    col_a = calc.get("colA")
+                    col_b = calc.get("colB")
                     if not new_c or col_a not in df.columns:
                         continue
-                    if calc.get("operation") in ("atan2","power") and col_b in df.columns:
+                    if calc.get("operation") in ("atan2", "power") and col_b in df.columns:
                         df = df.withColumn(new_c, fn(F.col(col_a).cast("double"), F.col(col_b).cast("double")))
                     else:
                         df = df.withColumn(new_c, fn(F.col(col_a).cast("double")))
 
             elif ntype == "combine_cols":
-                new_col, sep = (cfg.get("newColName") or "combined").strip(), cfg.get("separator", " ")
+                new_col = (cfg.get("newColName") or "combined").strip()
+                sep = cfg.get("separator", " ")
                 selected = [c for c in cfg.get("selectedCols", []) if c in df.columns]
                 remove_orig = cfg.get("removeOriginal", False)
                 if new_col and selected:
@@ -1225,10 +1208,14 @@ def _run_spark(input_table, output_name, transforms, row_count):
                 gc = [c for c in cfg.get("groupCols", []) if c in df.columns]
                 ac = cfg.get("aggCols", [])
                 if gc and ac:
-                    fn_map = {"COUNT":F.count,"SUM":F.sum,"AVG":F.avg,"MIN":F.min,
-                              "MAX":F.max,"COUNT DISTINCT":F.countDistinct}
-                    aggs = [fn_map.get(a["func"],F.count)(a["col"]).alias(a["alias"])
-                            for a in ac if a.get("col") in df.columns]
+                    fn_map = {
+                        "COUNT": F.count, "SUM": F.sum, "AVG": F.avg,
+                        "MIN": F.min, "MAX": F.max, "COUNT DISTINCT": F.countDistinct,
+                    }
+                    aggs = [
+                        fn_map.get(a["func"], F.count)(a["col"]).alias(a["alias"])
+                        for a in ac if a.get("col") in df.columns
+                    ]
                     if aggs:
                         df = df.groupBy(*gc).agg(*aggs)
 
@@ -1242,16 +1229,19 @@ def _run_spark(input_table, output_name, transforms, row_count):
         except Exception as e:
             print(f"[Spark] {ntype} error: {e} — dilewati")
 
-    df.write.jdbc(url="jdbc:postgresql://postgres:5432/airflow",
-                  table=f"warehouse.{safe_out}", mode="overwrite",
-                  properties={"user":"airflow","password":"airflow","driver":"org.postgresql.Driver"})
+    df.write.jdbc(
+        url="jdbc:postgresql://postgres:5432/airflow",
+        table=f"warehouse.{safe_out}",
+        mode="overwrite",
+        properties={"user": "airflow", "password": "airflow", "driver": "org.postgresql.Driver"},
+    )
 
     if row_count > 10_000:
         os.makedirs(PARQUET_DIR, exist_ok=True)
         parquet_path = f"{PARQUET_DIR}/{safe_out}.parquet"
         output_parts = max(1, row_count // 500_000)
         (df.coalesce(output_parts).write.mode("overwrite")
-           .option("compression","snappy").parquet(parquet_path))
+           .option("compression", "snappy").parquet(parquet_path))
         print(f"[Spark] Snappy Parquet saved: {parquet_path}")
 
     spark.stop()
