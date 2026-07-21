@@ -16,7 +16,10 @@ import os
 import json
 import hashlib
 import shutil
+from typing import Optional
+
 import pandas as pd
+import spark_config
 
 PARQUET_DIR      = "/data_csv/parquet"
 CACHE_DIR        = "/data_csv/spark_cache"   # materialized intermediate nodes
@@ -116,11 +119,9 @@ def compute_spark_config(size_mb: float) -> dict:
         }
 
 
-def get_spark_session(size_mb: float = 0):
+def get_spark_session(size_mb: float = 0, resource_config: Optional[dict] = None):
     """
-    Reuse satu SparkSession sepanjang proses hidup:
-      - biaya startup JVM/driver hanya dibayar sekali
-      - DataFrame yang sudah di-cache/materialize dari call sebelumnya tetap valid
+    Reuse satu SparkSession sepanjang proses hidup.
     Config diterapkan HANYA saat sesi pertama kali dibuat.
     """
     global _spark_session
@@ -129,28 +130,21 @@ def get_spark_session(size_mb: float = 0):
             _spark_session.sql("SELECT 1").collect()
             return _spark_session
         except Exception:
-            _spark_session = None  # sesi mati, rebuild di bawah
+            _spark_session = None
 
     from pyspark.sql import SparkSession
 
-    cfg = compute_spark_config(size_mb)
-    builder = (
-        SparkSession.builder
-        .appName("ETLFlow_Preview_Engine")
-        .config("spark.master", "spark://spark:7077")
-        .config("spark.jars", "/opt/spark/jars/postgresql-42.6.0.jar")
-        .config("spark.executor.memory", cfg["executor_memory"])
-        .config("spark.executor.cores", cfg["executor_cores"])
-        .config("spark.dynamicAllocation.enabled", cfg["dynamic_allocation"])
-        .config("spark.dynamicAllocation.maxExecutors", cfg["max_executors"])
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.shuffle.partitions", str(cfg["shuffle_partitions"]))
-        .config("spark.default.parallelism", str(cfg["shuffle_partitions"]))
-        .config("spark.sql.autoBroadcastJoinThreshold", str(BROADCAST_MAX_MB * 1024 * 1024))
-    )
+    profile = spark_config.estimate_dataset_profile(file_size_bytes=max(int(size_mb * 1024 * 1024), 0), row_count=0, col_count=0)
+    profile["size_mb"] = size_mb
+    session_cfg = spark_config.get_runtime_spark_session_config(profile)
+    if resource_config:
+        session_cfg.update({k: str(v) if isinstance(v, (int, float)) else v for k, v in resource_config.items()})
+
+    builder = SparkSession.builder.appName("ETLFlow_Preview_Engine")
+    for key, value in session_cfg.items():
+        builder = builder.config(key, str(value))
     _spark_session = builder.getOrCreate()
-    print(f"[SparkEngine] SparkSession dibuat dengan config: {cfg}")
+    print(f"[SparkEngine] SparkSession dibuat dengan config: {session_cfg}")
     return _spark_session
 
 
