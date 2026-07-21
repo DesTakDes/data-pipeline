@@ -571,7 +571,7 @@ def _sql_when_fragment(col, condition, value, result):
             num = float(value)
         except (TypeError, ValueError):
             return None
-        return f"WHEN TRY_CAST({col_ref} AS DOUBLE) {condition} {num} THEN {result_lit}"
+        return f"WHEN TRY_CAST({col_ref} AS DOUBLE PRECISION) {condition} {num} THEN {result_lit}"
     op = condition if condition in (\'=\', \'!=\') else \'=\'
     return f"WHEN {col_ref} {op} {repr(value)} THEN {result_lit}"
 
@@ -883,25 +883,30 @@ def _run_duckdb(input_table, output_name, transforms, progress_cb=None):
 
 # ── Postgres Runner ───────────────────────────────────────────────────────────
 
+def _pg_cast_type():
+    return {
+        "TEXT": "TEXT", "INTEGER": "INTEGER", "BIGINT": "BIGINT",
+        "NUMERIC": "NUMERIC", "BOOLEAN": "BOOLEAN",
+        "DATE": "DATE", "TIMESTAMP": "TIMESTAMP", "VARCHAR(255)": "VARCHAR(255)",
+    }
+
+
 def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
-    safe_out   = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
-    out_table  = f"warehouse.{safe_out}"
+    """PostgreSQL native runner untuk dataset kecil (<50MB).
+    Setiap transform ditulis sebagai CREATE TABLE AS (immutable step)."""
+    safe_out  = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+    out_table = f"warehouse.{safe_out}"
     schema, tname = input_table.split(".",1) if "." in input_table else ("staging", input_table)
+    PG_TYPE = _pg_cast_type()
 
     cols = [r[0] for r in pg_hook.get_records(f"""
         SELECT column_name FROM information_schema.columns
-        WHERE table_schema=\'{schema}\' AND table_name=\'{tname}\'
+        WHERE table_schema=\'{schema}\' AND table_name=\'{tname.strip(chr(34))}\'
         AND column_name NOT IN (\'loaded_at\',\'date_partition\')
         ORDER BY ordinal_position
     """)]
 
     pg_hook.run("CREATE SCHEMA IF NOT EXISTS warehouse")
-    pg_hook.run(f"DROP TABLE IF EXISTS {out_table}")
-    pg_hook.run(f"""
-        CREATE TABLE {out_table} AS
-        WITH _base AS (SELECT {", ".join(f\'"{c}"\' for c in cols)} FROM {input_table})
-        SELECT * FROM _base LIMIT 0
-    """)
 
     cur_from = input_table
     step     = 0
@@ -911,72 +916,261 @@ def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
         step  += 1
         tmp    = f"staging._etl_{task_id}_s{step}"
         try:
-            if   ntype == "filter_rows":
+            if ntype == "filter_rows":
                 pg_hook.run(f"CREATE TABLE {tmp} AS SELECT * FROM {cur_from} WHERE {config.get(\'formula\',\'1=1\')}")
+
             elif ntype == "select_col":
                 sc = [c for c in config.get("columns",[]) if c in cols]
                 if sc:
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(sc)} FROM {cur_from}"); cols=sc
-                else: tmp=cur_from; step-=1; continue
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(sc)} FROM {cur_from}")
+                    cols = sc
+                else:
+                    tmp=cur_from; step-=1; continue
+
             elif ntype == "drop_col":
                 kc = [c for c in cols if c not in set(config.get("columns",[]))]
-                pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(kc)} FROM {cur_from}"); cols=kc
+                pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(kc)} FROM {cur_from}")
+                cols = kc
+
             elif ntype == "rename_col":
                 rn = config.get("renames",{})
-                ex = ", ".join(f\'"{c}" AS "{rn.get(c,c)}"\' for c in cols)
-                pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {ex} FROM {cur_from}")
-                cols = [rn.get(c,c) for c in cols]
+                if rn:
+                    ex = ", ".join(f\'"{c}" AS "{rn.get(c,c)}"\' for c in cols)
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {ex} FROM {cur_from}")
+                    cols = [rn.get(c,c) for c in cols]
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "add_const":
+                name  = config.get("name","new_col")
+                val   = config.get("value","")
+                dtype = PG_TYPE.get(config.get("dtype","TEXT"), "TEXT")
+                if name:
+                    pg_hook.run(
+                        f\'CREATE TABLE {tmp} AS SELECT {_q(cols)}, CAST({repr(val)} AS {dtype}) AS "{name}" FROM {cur_from}\'
+                    )
+                    if name not in cols:
+                        cols = cols + [name]
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "set_val":
+                target = config.get("targetCol","")
+                if target and target in cols:
+                    if config.get("useExpr"):
+                        expr = config.get("expr", f\'"{target}"\')
+                    else:
+                        src  = config.get("sourceCol", target)
+                        expr = f\'"{src}"\' if src in cols else f\'"{target}"\'
+                    sel = ", ".join(
+                        f\'({expr}) AS "{c}"\' if c == target else f\'"{c}"\'
+                        for c in cols
+                    )
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "val_mapper":
+                src, new_col = config.get("sourceCol",""), config.get("newColName","mapped")
+                whens, else_v = config.get("whens",[]), config.get("elseValue","")
+                if src in cols and whens:
+                    fragments = []
+                    for w in whens:
+                        condition = w.get("condition","=")
+                        value     = w.get("value","")
+                        result    = w.get("result","")
+                        if condition not in ("IS NULL","IS NOT NULL") and value == "":
+                            continue
+                        frag = _sql_when_fragment(src, condition, value, result)
+                        if frag:
+                            fragments.append(frag)
+                    if fragments:
+                        case_expr = f\'CASE {" ".join(fragments)} ELSE {repr(else_v)} END AS "{new_col}"\'
+                        pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(cols)}, {case_expr} FROM {cur_from}")
+                        if new_col not in cols:
+                            cols = cols + [new_col]
+                    else:
+                        tmp=cur_from; step-=1; continue
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "fill_null":
+                fc = [c for c in config.get("columns",[]) if c in cols]
+                ft = config.get("fillType","value")
+                fv = config.get("fillValue","")
+                if not fc:
+                    tmp=cur_from; step-=1; continue
+                elif ft == "value":
+                    sel = ", ".join(
+                        f\'COALESCE("{c}"::TEXT,{repr(str(fv))})::TEXT AS "{c}"\' if c in fc else f\'"{c}"\'
+                        for c in cols
+                    )
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
+                elif ft == "mean":
+                    sel = ", ".join(
+                        f\'COALESCE("{c}", (SELECT AVG("{c}") FROM {cur_from})) AS "{c}"\' if c in fc else f\'"{c}"\'
+                        for c in cols
+                    )
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
+                elif ft == "median":
+                    sel = ", ".join(
+                        f\'COALESCE("{c}", (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY "{c}") FROM {cur_from})) AS "{c}"\'
+                        if c in fc else f\'"{c}"\'
+                        for c in cols
+                    )
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
+                elif ft == "mode":
+                    sel = ", ".join(
+                        f\'COALESCE("{c}", (SELECT "{c}" FROM {cur_from} WHERE "{c}" IS NOT NULL '
+                        f\'GROUP BY "{c}" ORDER BY COUNT(*) DESC LIMIT 1)) AS "{c}"\'
+                        if c in fc else f\'"{c}"\'
+                        for c in cols
+                    )
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
+                elif ft in ("forward","backward"):
+                    # Catatan: correlated subquery -> aman untuk data <50MB (target
+                    # engine ini), tapi tidak scalable untuk data lebih besar.
+                    cmp_op = "<" if ft == "forward" else ">"
+                    order_dir = "DESC" if ft == "forward" else "ASC"
+                    sel_parts = []
+                    for c in cols:
+                        if c in fc:
+                            sel_parts.append(
+                                f\'COALESCE(t1."{c}", (SELECT t2."{c}" FROM {cur_from} t2 \'
+                                f\'WHERE t2.ctid {cmp_op} t1.ctid AND t2."{c}" IS NOT NULL \'
+                                f\'ORDER BY t2.ctid {order_dir} LIMIT 1)) AS "{c}"\'
+                            )
+                        else:
+                            sel_parts.append(f\'t1."{c}"\')
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {\', \'.join(sel_parts)} FROM {cur_from} t1")
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "change_type":
+                types = config.get("types",{})
+                if types:
+                    sel = ", ".join(
+                        f\'CAST("{c}" AS {PG_TYPE.get(types[c],"TEXT")}) AS "{c}"\' if c in types else f\'"{c}"\'
+                        for c in cols
+                    )
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "order_table":
+                orders = [o for o in config.get("orders",[]) if o.get("col") in cols]
+                if orders:
+                    oc = ", ".join(f\'"{o["col"]}" {o.get("dir","ASC")}\' for o in orders)
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(cols)} FROM {cur_from} ORDER BY {oc}")
+                else:
+                    tmp=cur_from; step-=1; continue
+
             elif ntype == "group_agg":
                 gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
                 if gc and ac:
                     ae=", ".join(f\'{a["func"]}("{a["col"]}") AS "{a["alias"]}"\' for a in ac)
                     pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(gc)}, {ae} FROM {cur_from} GROUP BY {_q(gc)}")
                     cols=gc+[a["alias"] for a in ac]
-                else: tmp=cur_from; step-=1; continue
-            elif ntype == "join_data":
-                right_table = config.get("rightTable", "")
-                left_col    = config.get("leftCol", "")
-                right_col   = config.get("rightCol", "")
-                if not (right_table and left_col):
-                    tmp = cur_from; step -= 1; continue
-
-                raw_type = config.get("joinType", "INNER JOIN").upper()
-                is_cross = "CROSS" in raw_type
-                sql_join = raw_type if not is_cross else "CROSS JOIN"
-
-                schema_r, tname_r = right_table.split(".", 1) if "." in right_table else ("staging", right_table)
-                r_cols = [r[0] for r in pg_hook.get_records(f"""
-                    SELECT column_name FROM information_schema.columns
-                    WHERE table_schema=\'{schema_r}\' AND table_name=\'{tname_r.strip(chr(34))}\'
-                    ORDER BY ordinal_position
-                """)]
-
-                dup = [c for c in r_cols if c in cols and c != right_col]
-                left_select  = ", ".join(f\'l."{c}"\' for c in cols)
-                right_select = ", ".join(
-                    f\'r."{c}" AS "{c}_right"\' if c in dup else f\'r."{c}"\'
-                    for c in r_cols
-                )
-
-                if is_cross:
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {left_select}, {right_select} FROM {cur_from} l CROSS JOIN {right_table} r")
-                elif right_col:
-                    pg_hook.run(
-                        f"CREATE TABLE {tmp} AS SELECT {left_select}, {right_select} "
-                        f'FROM {cur_from} l {sql_join} {right_table} r '
-                        f'ON l."{left_col}" = r."{right_col}"'
-                    )
                 else:
-                    tmp = cur_from; step -= 1; continue
+                    tmp=cur_from; step-=1; continue
 
-                cols = cols + [f"{c}_right" if c in dup else c for c in r_cols]
+            elif ntype == "join_data":
+                right_table = config.get("rightTable","")
+                left_col    = config.get("leftCol","")
+                right_col   = config.get("rightCol","")
+                if not (right_table and left_col):
+                    tmp=cur_from; step-=1; continue
+                else:
+                    raw_type = config.get("joinType","INNER JOIN").upper()
+                    is_cross = "CROSS" in raw_type
+                    sql_join = "CROSS JOIN" if is_cross else raw_type
+
+                    schema_r, tname_r = right_table.split(".",1) if "." in right_table else ("staging", right_table)
+                    r_cols = [r[0] for r in pg_hook.get_records(f"""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_schema=\'{schema_r}\' AND table_name=\'{tname_r.strip(chr(34))}\'
+                        ORDER BY ordinal_position
+                    """)]
+
+                    dup = [c for c in r_cols if c in cols and c != right_col]
+                    left_sel  = ", ".join(f\'l."{c}"\' for c in cols)
+                    right_sel = ", ".join(
+                        f\'r."{c}" AS "{c}_right"\' if c in dup else f\'r."{c}"\'
+                        for c in r_cols
+                    )
+
+                    if is_cross:
+                        pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {left_sel}, {right_sel} FROM {cur_from} l CROSS JOIN {right_table} r")
+                        cols = cols + [f"{c}_right" if c in dup else c for c in r_cols]
+                    elif right_col:
+                        pg_hook.run(
+                            f"CREATE TABLE {tmp} AS SELECT {left_sel}, {right_sel} "
+                            f\'FROM {cur_from} l {sql_join} {right_table} r ON l."{left_col}" = r."{right_col}"\'
+                        )
+                        cols = cols + [f"{c}_right" if c in dup else c for c in r_cols]
+                    else:
+                        tmp=cur_from; step-=1; continue
+
+            elif ntype == "calc":
+                new_col = (config.get("newColName") or "result").strip()
+                col_a, col_b, op = config.get("colA",""), config.get("colB",""), config.get("operation","+")
+                if new_col and col_a in cols and col_b in cols:
+                    if op == "/":
+                        expr = (f\'CASE WHEN CAST("{col_b}" AS DOUBLE PRECISION) != 0 \'
+                                f\'THEN CAST("{col_a}" AS DOUBLE PRECISION) / CAST("{col_b}" AS DOUBLE PRECISION) \'
+                                f\'ELSE NULL END\')
+                    else:
+                        expr = f\'(CAST("{col_a}" AS DOUBLE PRECISION) {op} CAST("{col_b}" AS DOUBLE PRECISION))\'
+                    pg_hook.run(f\'CREATE TABLE {tmp} AS SELECT {_q(cols)}, {expr} AS "{new_col}" FROM {cur_from}\')
+                    if new_col not in cols:
+                        cols = cols + [new_col]
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "adv_calculator":
+                SCI = {"sin":"SIN","cos":"COS","sqrt":"SQRT","radians":"RADIANS","atan2":"ATAN2","power":"POWER"}
+                exprs, new_cols = [], []
+                for calc in config.get("calculations",[]):
+                    fn    = SCI.get(calc.get("operation","sin"),"SIN")
+                    col_a = calc.get("colA",""); col_b = calc.get("colB","")
+                    new_c = (calc.get("newColName") or "").strip()
+                    if not new_c or col_a not in cols:
+                        continue
+                    if fn in ("ATAN2","POWER") and col_b in cols:
+                        exprs.append(f\'{fn}(CAST("{col_a}" AS DOUBLE PRECISION), CAST("{col_b}" AS DOUBLE PRECISION)) AS "{new_c}"\')
+                    else:
+                        exprs.append(f\'{fn}(CAST("{col_a}" AS DOUBLE PRECISION)) AS "{new_c}"\')
+                    new_cols.append(new_c)
+                if exprs:
+                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(cols)}, {\', \'.join(exprs)} FROM {cur_from}")
+                    cols = cols + new_cols
+                else:
+                    tmp=cur_from; step-=1; continue
+
+            elif ntype == "combine_cols":
+                new_col = (config.get("newColName") or "combined").strip()
+                sep     = config.get("separator"," ")
+                selected = [c for c in config.get("selectedCols",[]) if c in cols]
+                remove_orig = config.get("removeOriginal", False)
+                if new_col and selected:
+                    concat_expr = f\' || {repr(sep)} || \'.join(
+                        f\'COALESCE(CAST("{c}" AS TEXT), \\\'\\\')\' for c in selected
+                    )
+                    keep = [c for c in cols if not (remove_orig and c in selected)]
+                    pg_hook.run(f\'CREATE TABLE {tmp} AS SELECT {_q(keep)}, ({concat_expr}) AS "{new_col}" FROM {cur_from}\')
+                    cols = keep + [new_col]
+                else:
+                    tmp=cur_from; step-=1; continue
 
             else:
                 tmp=cur_from; step-=1; continue
+
         except Exception as e:
             print(f"[PG] step {step} {ntype}: {e}")
             tmp=cur_from; step-=1
-        if tmp != cur_from: cur_from=tmp
+
+        if tmp != cur_from:
+            cur_from = tmp
 
     pg_hook.run(f"DROP TABLE IF EXISTS {out_table}")
     pg_hook.run(f"CREATE TABLE {out_table} AS SELECT {_q(cols)}, NOW() AS loaded_at FROM {cur_from}")
@@ -986,7 +1180,6 @@ def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
         WHERE table_schema=\'staging\' AND table_name LIKE \'_etl_{task_id}_s%\'
     """):
         pg_hook.run(f\'DROP TABLE IF EXISTS staging."{r[0]}"\')
-
 
 # ── Spark Runner ──────────────────────────────────────────────────────────────
 
