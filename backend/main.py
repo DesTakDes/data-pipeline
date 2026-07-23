@@ -61,411 +61,6 @@ def _q(cols: list) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# PARQUET UTILITIES
-# ════════════════════════════════════════════════════════════════════════════
-
-def save_dataframe_to_parquet(df: pd.DataFrame, output_name: str, subdir: str = "") -> str:
-    base_dir = os.path.join(PARQUET_DIR, subdir) if subdir else PARQUET_DIR
-    os.makedirs(base_dir, exist_ok=True)
-    parquet_path = os.path.join(base_dir, f"{output_name}.parquet")
-    df.to_parquet(parquet_path, index=False, engine="pyarrow", compression="snappy")
-    meta_path = os.path.join(base_dir, f"{output_name}.meta.json")
-    with open(meta_path, "w") as f:
-        json.dump({
-            "output_name": output_name,
-            "row_count":   len(df),
-            "col_count":   len(df.columns),
-            "columns":     list(df.columns),
-            "saved_at":    datetime.now().isoformat(),
-            "compression": "snappy",
-            "file_size_bytes": os.path.getsize(parquet_path),
-        }, f, indent=2)
-    print(f"[Parquet] Saved {len(df):,} rows → {parquet_path}")
-    return parquet_path
-
-
-def batch_insert_to_postgres(conn, table: str, columns: list, rows: list, batch_size: int = BATCH_INSERT_SIZE):
-    if not rows:
-        return 0
-    cols_quoted  = [f'"{c}"' for c in columns]
-    placeholders = ", ".join(["%s"] * len(columns))
-    insert_sql   = f'INSERT INTO {table} ({", ".join(cols_quoted)}) VALUES ({placeholders})'
-    cur = conn.cursor()
-    total_inserted = 0
-    try:
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i + batch_size]
-            psycopg2.extras.execute_batch(cur, insert_sql, batch, page_size=batch_size)
-            conn.commit()
-            total_inserted += len(batch)
-    finally:
-        cur.close()
-    return total_inserted
-
-
-def dataframe_to_postgres_batch(conn, df: pd.DataFrame, table: str, batch_size: int = BATCH_INSERT_SIZE):
-    columns = list(df.columns)
-    rows = []
-    for row in df.itertuples(index=False):
-        rows.append(tuple(
-            None if (v is None or (isinstance(v, float) and pd.isna(v))) else v
-            for v in row
-        ))
-    return batch_insert_to_postgres(conn, table, columns, rows, batch_size)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# DUCKDB TRANSFORM ENGINE
-# ════════════════════════════════════════════════════════════════════════════
-
-def _duckdb_available() -> bool:
-    try:
-        import duckdb
-        return True
-    except ImportError:
-        return False
-
-
-def _build_duckdb_sql(input_alias: str, transforms: list, limit: Optional[int] = None,
-                       right_tables: Optional[dict] = None) -> str:
-    """Compile all transforms into a single DuckDB CTE chain SQL."""
-    right_tables = right_tables or {}
-    cte_parts  = []
-    step       = 0
-    cur_alias  = input_alias
-    cur_cols   = None
-
-    DTYPE_MAP = {
-        "TEXT": "VARCHAR", "INTEGER": "INTEGER", "BIGINT": "BIGINT",
-        "NUMERIC": "DOUBLE", "BOOLEAN": "BOOLEAN",
-        "DATE": "DATE", "TIMESTAMP": "TIMESTAMP", "VARCHAR(255)": "VARCHAR",
-    }
-
-    for tx in transforms:
-        ntype  = tx.get("type", "")
-        config = tx.get("config") or {}
-        step  += 1
-        alias  = f"s{step}"
-        try:
-            if ntype == "filter_rows":
-                formula = config.get("formula", "1=1")
-                cte_parts.append(f"{alias} AS (SELECT * FROM {cur_alias} WHERE {formula})")
-            elif ntype == "select_col":
-                cols = [c for c in config.get("columns", []) if c]
-                if cols:
-                    cte_parts.append(f"{alias} AS (SELECT {_q(cols)} FROM {cur_alias})")
-                    cur_cols = cols
-                else:
-                    step -= 1; continue
-            elif ntype == "drop_col":
-                drop = set(config.get("columns", []))
-                if cur_cols:
-                    keep = [c for c in cur_cols if c not in drop]
-                    cte_parts.append(f"{alias} AS (SELECT {_q(keep)} FROM {cur_alias})")
-                    cur_cols = keep
-                else:
-                    excl = ", ".join(f'"{c}"' for c in drop)
-                    cte_parts.append(f"{alias} AS (SELECT * EXCLUDE ({excl}) FROM {cur_alias})")
-            elif ntype == "rename_col":
-                renames = config.get("renames", {})
-                if not renames:
-                    step -= 1; continue
-                if cur_cols:
-                    exprs = [f'"{c}" AS "{renames.get(c, c)}"' for c in cur_cols]
-                    cte_parts.append(f"{alias} AS (SELECT {', '.join(exprs)} FROM {cur_alias})")
-                    cur_cols = [renames.get(c, c) for c in cur_cols]
-                else:
-                    rename_sql = ", ".join(f'"{o}" AS "{n}"' for o, n in renames.items())
-                    cte_parts.append(f"{alias} AS (SELECT * RENAME ({rename_sql}) FROM {cur_alias})")
-            elif ntype == "add_const":
-                name  = config.get("name", "new_col")
-                val   = config.get("value", "")
-                dtype = DTYPE_MAP.get(config.get("dtype", "TEXT"), "VARCHAR")
-                cte_parts.append(f'{alias} AS (SELECT *, CAST({repr(val)} AS {dtype}) AS "{name}" FROM {cur_alias})')
-                if cur_cols:
-                    cur_cols = cur_cols + [name]
-            elif ntype == "set_val":
-                target = config.get("targetCol", "")
-                if not target:
-                    step -= 1; continue
-                if config.get("useExpr"):
-                    expr = config.get("expr", f'"{target}"')
-                else:
-                    src  = config.get("sourceCol", target)
-                    expr = f'"{src}"'
-                cte_parts.append(f'{alias} AS (SELECT * REPLACE ({expr} AS "{target}") FROM {cur_alias})')
-            elif ntype == "val_mapper":
-                src     = config.get("sourceCol", "")
-                new_col = config.get("newColName", "mapped")
-                whens   = config.get("whens", [])
-                else_v  = config.get("elseValue", "")
-                if not src or not whens:
-                    step -= 1; continue
-                fragments = []
-                for w in whens:
-                    condition = w.get("condition", "=")
-                    value     = w.get("value", "")
-                    result    = w.get("result", "")
-                    # IS NULL / IS NOT NULL tidak butuh value, sisanya wajib punya value
-                    if condition not in ("IS NULL", "IS NOT NULL") and value == "":
-                        continue
-                    if result == "" and result != 0:
-                        continue
-                    frag = _sql_when_fragment(src, condition, value, result)
-                    if frag:
-                        fragments.append(frag)
-                if not fragments:
-                    step -= 1; continue
-                case_expr = f'CASE {" ".join(fragments)} ELSE {repr(else_v)} END AS "{new_col}"'
-                cte_parts.append(f"{alias} AS (SELECT *, {case_expr} FROM {cur_alias})")
-                if cur_cols:
-                    cur_cols = cur_cols + [new_col]
-            elif ntype == "fill_null":
-                fill_cols = config.get("columns", [])
-                fill_val  = config.get("fillValue", "")
-                if fill_cols and config.get("fillType", "value") == "value":
-                    replace_parts = ", ".join(
-                        f'COALESCE("{c}", {repr(str(fill_val))}) AS "{c}"'
-                        for c in fill_cols
-                    )
-                    cte_parts.append(f"{alias} AS (SELECT * REPLACE ({replace_parts}) FROM {cur_alias})")
-                else:
-                    step -= 1; continue
-            elif ntype == "change_type":
-                types = config.get("types", {})
-                if not types:
-                    step -= 1; continue
-                replace_parts = ", ".join(
-                    f'TRY_CAST("{c}" AS {DTYPE_MAP.get(t, "VARCHAR")}) AS "{c}"'
-                    for c, t in types.items()
-                )
-                cte_parts.append(f"{alias} AS (SELECT * REPLACE ({replace_parts}) FROM {cur_alias})")
-            elif ntype == "order_table":
-                orders = config.get("orders", [])
-                if not orders:
-                    step -= 1; continue
-                oc = ", ".join(
-                    f'"{o["col"]}" {o.get("dir", "ASC")}'
-                    for o in orders if o.get("col")
-                )
-                cte_parts.append(f"{alias} AS (SELECT * FROM {cur_alias} ORDER BY {oc})")
-            elif ntype == "group_agg":
-                gcols = config.get("groupCols", [])
-                acols = config.get("aggCols", [])
-                if not gcols or not acols:
-                    step -= 1; continue
-                agg_exprs = []
-                for a in acols:
-                    fn  = a.get("func", "COUNT")
-                    col = a.get("col", "")
-                    aln = a.get("alias", f'{col}_{fn.lower()}')
-                    if fn == "COUNT DISTINCT":
-                        agg_exprs.append(f'COUNT(DISTINCT "{col}") AS "{aln}"')
-                    else:
-                        agg_exprs.append(f'{fn}("{col}") AS "{aln}"')
-                g = _q(gcols)
-                cte_parts.append(f"{alias} AS (SELECT {g}, {', '.join(agg_exprs)} FROM {cur_alias} GROUP BY {g})")
-                cur_cols = gcols + [a.get("alias", "") for a in acols]
-            elif ntype == "calc":
-                new_col   = (config.get("newColName") or "result").strip()
-                col_a     = config.get("colA", "")
-                col_b     = config.get("colB", "")
-                operation = config.get("operation", "+")
-                if not (new_col and col_a and col_b):
-                    step -= 1; continue
-                op_expr = f'TRY_CAST("{col_a}" AS DOUBLE) {operation} TRY_CAST("{col_b}" AS DOUBLE)'
-                cte_parts.append(f'{alias} AS (SELECT *, ({op_expr}) AS "{new_col}" FROM {cur_alias})')
-                if cur_cols:
-                    cur_cols = cur_cols + [new_col]
-            elif ntype == "adv_calculator":
-                calcs   = config.get("calculations", [])
-                SCI_MAP = {
-                    "sin": "SIN", "cos": "COS", "sqrt": "SQRT",
-                    "radians": "RADIANS", "atan2": "ATAN2", "power": "POWER",
-                }
-                exprs = []
-                for calc in calcs:
-                    fn    = SCI_MAP.get(calc.get("operation", "sin"), "SIN")
-                    col_a = calc.get("colA", "")
-                    col_b = calc.get("colB", "")
-                    new_c = (calc.get("newColName") or "").strip()
-                    if not new_c or not col_a:
-                        continue
-                    if fn in ("ATAN2", "POWER"):
-                        exprs.append(f'{fn}(TRY_CAST("{col_a}" AS DOUBLE), TRY_CAST("{col_b}" AS DOUBLE)) AS "{new_c}"')
-                    else:
-                        exprs.append(f'{fn}(TRY_CAST("{col_a}" AS DOUBLE)) AS "{new_c}"')
-                if exprs:
-                    cte_parts.append(f'{alias} AS (SELECT *, {", ".join(exprs)} FROM {cur_alias})')
-                else:
-                    step -= 1; continue
-            elif ntype == "combine_cols":
-                new_col     = (config.get("newColName") or "combined").strip()
-                sep         = config.get("separator", " ")
-                selected    = config.get("selectedCols", [])
-                remove_orig = config.get("removeOriginal", False)
-                if not new_col or not selected:
-                    step -= 1; continue
-                concat_parts = f" || {repr(sep)} || ".join(
-                    f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in selected
-                )
-                if remove_orig:
-                    excl = ", ".join(f'"{c}"' for c in selected)
-                    cte_parts.append(f'{alias} AS (SELECT * EXCLUDE ({excl}), ({concat_parts}) AS "{new_col}" FROM {cur_alias})')
-                else:
-                    cte_parts.append(f'{alias} AS (SELECT *, ({concat_parts}) AS "{new_col}" FROM {cur_alias})')
-                if cur_cols:
-                    cur_cols = [c for c in cur_cols if c not in (selected if remove_orig else [])]
-                    if new_col not in cur_cols:
-                        cur_cols = cur_cols + [new_col]
-            elif ntype == "join_data":
-                right_table = config.get("rightTable", "")
-                left_col    = config.get("leftCol", "")
-                right_col   = config.get("rightCol", "")
-                r_info      = right_tables.get(right_table)
-
-                if not (right_table and left_col and r_info):
-                    step -= 1; continue
-
-                r_alias  = r_info["alias"]
-                r_cols   = r_info.get("columns", [])
-                raw_type = config.get("joinType", "INNER JOIN").upper()
-                is_cross = "CROSS" in raw_type
-                sql_join = "CROSS JOIN" if is_cross else raw_type
-
-                dup = [c for c in r_cols if cur_cols and c in cur_cols and c != right_col]
-                right_select = ", ".join(
-                    f'{r_alias}."{c}" AS "{c}_right"' if c in dup else f'{r_alias}."{c}"'
-                    for c in r_cols
-                ) if r_cols else f"{r_alias}.*"
-
-                select_clause = f"{cur_alias}.*, {right_select}"
-
-                if is_cross:
-                    cte_parts.append(
-                        f"{alias} AS (SELECT {select_clause} FROM {cur_alias} CROSS JOIN {r_alias})"
-                    )
-                elif right_col:
-                    cte_parts.append(
-                        f'{alias} AS (SELECT {select_clause} FROM {cur_alias} '
-                        f'{sql_join} {r_alias} ON {cur_alias}."{left_col}" = {r_alias}."{right_col}")'
-                    )
-                else:
-                    step -= 1; continue
-
-                cur_cols = None
-            else:
-                step -= 1; continue
-        except Exception as e:
-            print(f"[DuckDB builder] step {step} ({ntype}) error: {e} — skipped")
-            step -= 1; continue
-        cur_alias = alias
-
-    limit_clause = f" LIMIT {limit}" if limit else ""
-    if cte_parts:
-        return f"WITH {', '.join(cte_parts)} SELECT * FROM {cur_alias}{limit_clause}"
-    return f"SELECT * FROM {input_alias}{limit_clause}"
-
-
-def _run_duckdb_pipeline(input_table, output_name, transforms, progress_cb=None):
-    import duckdb
-
-    def upd(pct, msg):
-        print(f"[DuckDB] {pct}% — {msg}")
-        if progress_cb:
-            try:
-                progress_cb(pct, msg)
-            except Exception:
-                pass
-
-    t0  = time.time()
-    con = duckdb.connect(":memory:")
-    pg  = get_conn()
-
-    try:
-        cur = pg.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM {input_table}")
-        row_count = cur.fetchone()[0]
-        cur.execute("SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0", (input_table,))
-        size_mb = float(cur.fetchone()[0] or 0)
-        cur.close()
-        upd(3, f"{row_count:,} rows | {size_mb:.1f} MB")
-
-        upd(5, "Reading data from PostgreSQL…")
-        chunks = []
-        loaded = 0
-        offset = 0
-        cs     = 200_000
-        while True:
-            chunk = pd.read_sql(f"SELECT * FROM {input_table} LIMIT {cs} OFFSET {offset}", pg)
-            if chunk.empty:
-                break
-            chunks.append(chunk)
-            loaded  += len(chunk)
-            offset  += cs
-            pct      = 5 + int((loaded / max(row_count, 1)) * 35)
-            upd(pct, f"Loaded {loaded:,}/{row_count:,}…")
-            if len(chunk) < cs:
-                break
-
-        df_input = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-        con.register("_input", df_input)
-        upd(40, f"Data ready in DuckDB. Running {len(transforms)} transform(s)…")
-
-        sql        = _build_duckdb_sql("_input", transforms)
-        t_tx       = time.time()
-        result_df  = con.execute(sql).df()
-        elapsed_tx = time.time() - t_tx
-        actual     = len(result_df)
-        upd(75, f"Transforms done: {actual:,} rows in {elapsed_tx:.1f}s")
-
-        upd(78, "Saving to Parquet (snappy)…")
-        parquet_path = save_dataframe_to_parquet(result_df, output_name)
-        parquet_mb   = os.path.getsize(parquet_path) / (1024 * 1024)
-        upd(82, f"Parquet saved: {parquet_path} ({parquet_mb:.1f} MB)")
-
-        safe_out  = re.sub(r'[^a-z0-9_]', '_', output_name.lower()).strip('_') or "output"
-        out_table = f'warehouse."{safe_out}"'
-
-        pg.rollback()
-        wcur = pg.cursor()
-        wcur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
-        wcur.execute(f"DROP TABLE IF EXISTS {out_table}")
-
-        PG_TYPE = {
-            "int64": "BIGINT", "int32": "INTEGER",
-            "float64": "NUMERIC", "float32": "NUMERIC",
-            "bool": "BOOLEAN", "object": "TEXT",
-            "datetime64[ns]": "TIMESTAMP",
-        }
-        col_defs = ", ".join(
-            f'"{c}" {PG_TYPE.get(str(result_df[c].dtype), "TEXT")}'
-            for c in result_df.columns
-        )
-        wcur.execute(f"CREATE TABLE {out_table} ({col_defs}, loaded_at TIMESTAMP DEFAULT NOW())")
-        pg.commit()
-        wcur.close()
-
-        inserted = dataframe_to_postgres_batch(pg, result_df, out_table, BATCH_INSERT_SIZE)
-        upd(98, f"Batch insert complete: {inserted:,} rows")
-
-        elapsed = time.time() - t0
-        upd(100, f"Done! {actual:,} rows in {elapsed:.1f} seconds")
-        return {
-            "status":       "success",
-            "engine":       "duckdb",
-            "rows":         actual,
-            "cols":         len(result_df.columns),
-            "parquet_path": parquet_path,
-            "elapsed_s":    round(elapsed, 1),
-            "size_mb":      round(size_mb, 1),
-        }
-    finally:
-        con.close()
-        pg.close()
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # SPLIT DAG GENERATOR
 #
 # Architecture:
@@ -586,600 +181,6 @@ def _estimate_mb(pg_conn, table):
     except Exception:
         return 0.0
 
-
-def save_parquet_snappy(df, output_name, subdir=""):
-    base_dir = os.path.join(PARQUET_DIR, subdir) if subdir else PARQUET_DIR
-    os.makedirs(base_dir, exist_ok=True)
-    parquet_path = os.path.join(base_dir, f"{output_name}.parquet")
-    df.to_parquet(parquet_path, index=False, engine="pyarrow", compression="snappy")
-    meta_path = os.path.join(base_dir, f"{output_name}.meta.json")
-    import json as _json
-    with open(meta_path, "w") as f:
-        _json.dump({
-            "output_name": output_name,
-            "row_count":   len(df),
-            "col_count":   len(df.columns),
-            "columns":     list(df.columns),
-            "saved_at":    time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "compression": "snappy",
-            "file_size_bytes": os.path.getsize(parquet_path),
-        }, f, indent=2)
-    print(f"[Parquet] {len(df):,} rows → {parquet_path} (snappy)")
-    return parquet_path
-
-
-def batch_insert_df(conn, df, table, batch_size=BATCH_INSERT_SIZE):
-    columns      = list(df.columns)
-    cols_quoted  = [f\'"{c}"\' for c in columns]
-    placeholders = ", ".join(["%s"] * len(columns))
-    insert_sql   = f"INSERT INTO {table} ({', '.join(cols_quoted)}) VALUES ({placeholders})"
-    rows = [
-        tuple(None if (v is None or (isinstance(v, float) and pd.isna(v))) else v
-              for v in row)
-        for row in df.itertuples(index=False)
-    ]
-    cur = conn.cursor()
-    total = 0
-    try:
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i + batch_size]
-            psycopg2.extras.execute_batch(cur, insert_sql, batch, page_size=batch_size)
-            conn.commit()
-            total += len(batch)
-            print(f"[BatchInsert] {total:,}/{len(rows):,} → {table}")
-    finally:
-        cur.close()
-    return total
-
-
-# ── DuckDB SQL Builder ────────────────────────────────────────────────────────
-
-def _build_transform_sql(input_alias, transforms, limit=None):
-    DTYPE_MAP = {
-        'TEXT':'VARCHAR','INTEGER':'INTEGER','BIGINT':'BIGINT',
-        'NUMERIC':'DOUBLE','BOOLEAN':'BOOLEAN','DATE':'DATE',
-        'TIMESTAMP':'TIMESTAMP','VARCHAR(255)':'VARCHAR',
-    }
-    cte_parts = []
-    step      = 0
-    cur_alias = input_alias
-    cur_cols  = None
-
-    for tx in transforms:
-        ntype  = tx.get('type','')
-        config = tx.get('config') or {}
-        step  += 1
-        alias  = f's{step}'
-        try:
-            if ntype == 'filter_rows':
-                formula = config.get('formula','1=1')
-                cte_parts.append(f'{alias} AS (SELECT * FROM {cur_alias} WHERE {formula})')
-            elif ntype == 'select_col':
-                cols = [c for c in config.get('columns',[]) if c]
-                if cols:
-                    cte_parts.append(f"{alias} AS (SELECT {_q(cols)} FROM {cur_alias})")
-                    cur_cols = cols
-                else:
-                    step -= 1; continue
-            elif ntype == 'drop_col':
-                drop = set(config.get('columns',[]))
-                if cur_cols:
-                    keep = [c for c in cur_cols if c not in drop]
-                    cte_parts.append(f"{alias} AS (SELECT {_q(keep)} FROM {cur_alias})")
-                    cur_cols = keep
-                else:
-                    excl = ', '.join(f\'"{c}"\' for c in drop)
-                    cte_parts.append(f'{alias} AS (SELECT * EXCLUDE ({excl}) FROM {cur_alias})')
-            elif ntype == 'rename_col':
-                renames = config.get('renames',{})
-                if not renames: step -= 1; continue
-                if cur_cols:
-                    exprs = [f\'"{c}" AS "{renames.get(c,c)}"\' for c in cur_cols]
-                    cte_parts.append(f"{alias} AS (SELECT {', '.join(exprs)} FROM {cur_alias})")
-                    cur_cols = [renames.get(c,c) for c in cur_cols]
-                else:
-                    rs = ', '.join(f\'"{o}" AS "{n}"\' for o,n in renames.items())
-                    cte_parts.append(f'{alias} AS (SELECT * RENAME ({rs}) FROM {cur_alias})')
-            elif ntype == 'add_const':
-                name  = config.get('name','new_col')
-                val   = config.get('value','')
-                dtype = DTYPE_MAP.get(config.get('dtype','TEXT'),'VARCHAR')
-                cte_parts.append(f\'{alias} AS (SELECT *, CAST({repr(val)} AS {dtype}) AS "{name}" FROM {cur_alias})\')
-                if cur_cols: cur_cols = cur_cols + [name]
-            elif ntype == 'set_val':
-                target = config.get('targetCol','')
-                if not target: step -= 1; continue
-                if config.get('useExpr'):
-                    expr = config.get('expr', f\'"{target}"\')
-                else:
-                    src  = config.get('sourceCol', target)
-                    expr = f\'"{src}"\'
-                cte_parts.append(f\'{alias} AS (SELECT * REPLACE ({expr} AS "{target}") FROM {cur_alias})\')
-            elif ntype == 'val_mapper':
-                src     = config.get('sourceCol','')
-                new_col = config.get('newColName','mapped')
-                whens   = config.get('whens',[])
-                else_v  = config.get('elseValue','')
-                if not src or not whens: step -= 1; continue
-                fragments = []
-                for w in whens:
-                    condition = w.get(\'condition\', \'=\')
-                    value     = w.get(\'value\', \'\')
-                    result    = w.get(\'result\', \'\')
-                    if condition not in (\'IS NULL\', \'IS NOT NULL\') and value == \'\':
-                        continue
-                    frag = _sql_when_fragment(src, condition, value, result)
-                    if frag:
-                        fragments.append(frag)
-                if not fragments:
-                    step -= 1; continue
-                wc = \' \'.join(fragments)
-                cte_parts.append(f\'{alias} AS (SELECT *, CASE {wc} ELSE {repr(else_v)} END AS "{new_col}" FROM {cur_alias})\')
-                if cur_cols: cur_cols = cur_cols + [new_col]
-            elif ntype == 'fill_null':
-                fill_cols = config.get('columns',[])
-                fill_val  = config.get('fillValue','')
-                if fill_cols and config.get('fillType','value') == 'value':
-                    rp = ', '.join(f\'COALESCE("{c}", {repr(str(fill_val))}) AS "{c}"\' for c in fill_cols)
-                    cte_parts.append(f'{alias} AS (SELECT * REPLACE ({rp}) FROM {cur_alias})')
-                else: step -= 1; continue
-            elif ntype == 'change_type':
-                types = config.get('types',{})
-                if not types: step -= 1; continue
-                rp = ', '.join(f\'TRY_CAST("{c}" AS {DTYPE_MAP.get(t,"VARCHAR")}) AS "{c}"\' for c,t in types.items())
-                cte_parts.append(f'{alias} AS (SELECT * REPLACE ({rp}) FROM {cur_alias})')
-            elif ntype == 'order_table':
-                orders = config.get('orders',[])
-                if not orders: step -= 1; continue
-                oc = ', '.join(f\'"{o["col"]}" {o.get("dir","ASC")}\' for o in orders if o.get('col'))
-                cte_parts.append(f'{alias} AS (SELECT * FROM {cur_alias} ORDER BY {oc})')
-            elif ntype == 'group_agg':
-                gcols = config.get('groupCols',[])
-                acols = config.get('aggCols',[])
-                if not gcols or not acols: step -= 1; continue
-                agg_exprs = []
-                for a in acols:
-                    fn  = a.get('func','COUNT')
-                    col = a.get('col','')
-                    aln = a.get('alias', f\'{col}_{fn.lower()}\')
-                    if fn == 'COUNT DISTINCT':
-                        agg_exprs.append(f\'COUNT(DISTINCT "{col}") AS "{aln}"\')
-                    else:
-                        agg_exprs.append(f\'{fn}("{col}") AS "{aln}"\')
-                cte_parts.append(f"{alias} AS (SELECT {_q(gcols)}, {', '.join(agg_exprs)} FROM {cur_alias} GROUP BY {_q(gcols)})")
-                cur_cols = gcols + [a.get('alias','') for a in acols]
-            elif ntype == 'calc':
-                new_col = (config.get('newColName') or 'result').strip()
-                col_a   = config.get('colA','')
-                col_b   = config.get('colB','')
-                op      = config.get('operation','+')
-                if not (new_col and col_a and col_b): step -= 1; continue
-                cte_parts.append(f\'{alias} AS (SELECT *, (TRY_CAST("{col_a}" AS DOUBLE) {op} TRY_CAST("{col_b}" AS DOUBLE)) AS "{new_col}" FROM {cur_alias})\')
-                if cur_cols: cur_cols = cur_cols + [new_col]
-            elif ntype == 'adv_calculator':
-                calcs   = config.get('calculations',[])
-                SCI_MAP = {'sin':'SIN','cos':'COS','sqrt':'SQRT','radians':'RADIANS','atan2':'ATAN2','power':'POWER'}
-                exprs = []
-                for calc in calcs:
-                    fn    = SCI_MAP.get(calc.get('operation','sin'),'SIN')
-                    col_a = calc.get('colA','')
-                    col_b = calc.get('colB','')
-                    new_c = (calc.get('newColName') or '').strip()
-                    if not new_c or not col_a: continue
-                    if fn in ('ATAN2','POWER'):
-                        exprs.append(f\'{fn}(TRY_CAST("{col_a}" AS DOUBLE), TRY_CAST("{col_b}" AS DOUBLE)) AS "{new_c}"\')
-                    else:
-                        exprs.append(f\'{fn}(TRY_CAST("{col_a}" AS DOUBLE)) AS "{new_c}"\')
-                if exprs:
-                    cte_parts.append(f"{alias} AS (SELECT *, {', '.join(exprs)} FROM {cur_alias})")
-                else: step -= 1; continue
-            elif ntype == 'combine_cols':
-                new_col     = (config.get('newColName') or 'combined').strip()
-                sep         = config.get('separator',' ')
-                selected    = config.get('selectedCols',[])
-                remove_orig = config.get('removeOriginal',False)
-                if not new_col or not selected: step -= 1; continue
-                cp = f\' || {repr(sep)} || \'.join(f\'COALESCE(CAST("{c}" AS VARCHAR), \\\'\\\')\' for c in selected)
-                if remove_orig:
-                    excl = ', '.join(f\'"{c}"\' for c in selected)
-                    cte_parts.append(f\'{alias} AS (SELECT * EXCLUDE ({excl}), ({cp}) AS "{new_col}" FROM {cur_alias})\')
-                else:
-                    cte_parts.append(f\'{alias} AS (SELECT *, ({cp}) AS "{new_col}" FROM {cur_alias})\')
-            else:
-                step -= 1; continue
-        except Exception as e:
-            print(f"[SQL Builder] {ntype} error: {e}")
-            step -= 1; continue
-        cur_alias = alias
-
-    lc = f" LIMIT {limit}" if limit else ""
-    if cte_parts:
-        return f"WITH {', '.join(cte_parts)} SELECT * FROM {cur_alias}{lc}"
-    return f"SELECT * FROM {input_alias}{lc}"
-
-
-# ── DuckDB Runner ─────────────────────────────────────────────────────────────
-
-def _run_duckdb(input_table, output_name, transforms, progress_cb=None):
-    import duckdb
-    def upd(pct, msg):
-        print(f"[DuckDB] {pct}% — {msg}")
-        if progress_cb:
-            try: progress_cb(pct, msg)
-            except Exception: pass
-
-    t0  = time.time()
-    con = duckdb.connect(":memory:")
-    pg  = _get_conn()
-    try:
-        cur = pg.cursor()
-        cur.execute(f"SELECT COUNT(*) FROM {input_table}")
-        row_count = cur.fetchone()[0]
-        cur.close()
-        upd(3, f"{row_count:,} rows — reading data…")
-
-        chunks = []
-        loaded = 0
-        offset = 0
-        cs     = 200_000
-        while True:
-            chunk = pd.read_sql(f"SELECT * FROM {input_table} LIMIT {cs} OFFSET {offset}", pg)
-            if chunk.empty: break
-            chunks.append(chunk)
-            loaded += len(chunk)
-            offset += cs
-            upd(5 + int((loaded / max(row_count,1)) * 35), f"Loaded {loaded:,}/{row_count:,}…")
-            if len(chunk) < cs: break
-
-        df_input = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-        con.register("_input", df_input)
-        upd(40, f"Data ready. Running {len(transforms)} transform(s)…")
-
-        right_tables = {}
-        for idx, tx in enumerate(transforms):
-            if tx.get("type") == "join_data":
-                r_table = (tx.get("config") or {}).get("rightTable")
-                if r_table and r_table not in right_tables:
-                    r_df = pd.read_sql(f"SELECT * FROM {r_table}", pg)
-                    r_alias = f"_right_{idx}"
-                    con.register(r_alias, r_df)
-                    right_tables[r_table] = {"alias": r_alias, "columns": list(r_df.columns)}
-                    upd(42, f"Loaded right table for join: {r_table} ({len(r_df):,} rows)")
-
-        sql       = _build_transform_sql("_input", transforms)
-        t_tx      = time.time()
-        result_df = con.execute(sql).df()
-        actual    = len(result_df)
-        upd(75, f"Transforms done: {actual:,} rows ({time.time()-t_tx:.1f}s)")
-
-        upd(78, "Saving rows as Parquet file (snappy)…")
-        pq_path = save_parquet_snappy(result_df, output_name)
-        upd(82, f"Parquet: {pq_path}")
-
-        safe_out  = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
-        out_table = f\'warehouse."{safe_out}"\'
-        pg.rollback()
-        wcur = pg.cursor()
-        wcur.execute("CREATE SCHEMA IF NOT EXISTS warehouse")
-        wcur.execute(f"DROP TABLE IF EXISTS {out_table}")
-        PG_TYPE = {"int64":"BIGINT","int32":"INTEGER","float64":"NUMERIC","float32":"NUMERIC",
-                    "bool":"BOOLEAN","object":"TEXT","datetime64[ns]":"TIMESTAMP"}
-        col_defs = ", ".join(f\'"{c}" {PG_TYPE.get(str(result_df[c].dtype),"TEXT")}\' for c in result_df.columns)
-        wcur.execute(f"CREATE TABLE {out_table} ({col_defs}, loaded_at TIMESTAMP DEFAULT NOW())")
-        pg.commit()
-        wcur.close()
-
-        upd(84, f"Batch inserting {actual:,} rows to warehouse…")
-        inserted = batch_insert_df(pg, result_df, out_table, BATCH_INSERT_SIZE)
-        upd(99, f"Batch insert done: {inserted:,} rows")
-
-        elapsed = time.time() - t0
-        upd(100, f"Done! {actual:,} rows in {elapsed:.1f}s")
-        return {"status":"success","engine":"duckdb","rows":actual,"elapsed_s":round(elapsed,1)}
-    finally:
-        con.close()
-        pg.close()
-
-
-# ── Postgres Runner ───────────────────────────────────────────────────────────
-
-def _pg_cast_type():
-    return {
-        "TEXT": "TEXT", "INTEGER": "INTEGER", "BIGINT": "BIGINT",
-        "NUMERIC": "NUMERIC", "BOOLEAN": "BOOLEAN",
-        "DATE": "DATE", "TIMESTAMP": "TIMESTAMP", "VARCHAR(255)": "VARCHAR(255)",
-    }
-
-
-def _run_postgres(pg_hook, input_table, output_name, transforms, task_id):
-    """PostgreSQL native runner untuk dataset kecil (<50MB).
-    Setiap transform ditulis sebagai CREATE TABLE AS (immutable step)."""
-    safe_out  = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
-    out_table = f"warehouse.{safe_out}"
-    schema, tname = input_table.split(".",1) if "." in input_table else ("staging", input_table)
-    PG_TYPE = _pg_cast_type()
-
-    cols = [r[0] for r in pg_hook.get_records(f"""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema=\'{schema}\' AND table_name=\'{tname.strip(chr(34))}\'
-        AND column_name NOT IN (\'loaded_at\',\'date_partition\')
-        ORDER BY ordinal_position
-    """)]
-
-    pg_hook.run("CREATE SCHEMA IF NOT EXISTS warehouse")
-
-    cur_from = input_table
-    step     = 0
-    for tx in transforms:
-        ntype  = tx.get("type","")
-        config = tx.get("config") or {}
-        step  += 1
-        tmp    = f"staging._etl_{task_id}_s{step}"
-        try:
-            if ntype == "filter_rows":
-                pg_hook.run(f"CREATE TABLE {tmp} AS SELECT * FROM {cur_from} WHERE {config.get(\'formula\',\'1=1\')}")
-
-            elif ntype == "select_col":
-                sc = [c for c in config.get("columns",[]) if c in cols]
-                if sc:
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(sc)} FROM {cur_from}")
-                    cols = sc
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "drop_col":
-                kc = [c for c in cols if c not in set(config.get("columns",[]))]
-                pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(kc)} FROM {cur_from}")
-                cols = kc
-
-            elif ntype == "rename_col":
-                rn = config.get("renames",{})
-                if rn:
-                    ex = ", ".join(f\'"{c}" AS "{rn.get(c,c)}"\' for c in cols)
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {ex} FROM {cur_from}")
-                    cols = [rn.get(c,c) for c in cols]
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "add_const":
-                name  = config.get("name","new_col")
-                val   = config.get("value","")
-                dtype = PG_TYPE.get(config.get("dtype","TEXT"), "TEXT")
-                if name:
-                    pg_hook.run(
-                        f\'CREATE TABLE {tmp} AS SELECT {_q(cols)}, CAST({repr(val)} AS {dtype}) AS "{name}" FROM {cur_from}\'
-                    )
-                    if name not in cols:
-                        cols = cols + [name]
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "set_val":
-                target = config.get("targetCol","")
-                if target and target in cols:
-                    if config.get("useExpr"):
-                        expr = config.get("expr", f\'"{target}"\')
-                    else:
-                        src  = config.get("sourceCol", target)
-                        expr = f\'"{src}"\' if src in cols else f\'"{target}"\'
-                    sel = ", ".join(
-                        f\'({expr}) AS "{c}"\' if c == target else f\'"{c}"\'
-                        for c in cols
-                    )
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "val_mapper":
-                src, new_col = config.get("sourceCol",""), config.get("newColName","mapped")
-                whens, else_v = config.get("whens",[]), config.get("elseValue","")
-                if src in cols and whens:
-                    fragments = []
-                    for w in whens:
-                        condition = w.get("condition","=")
-                        value     = w.get("value","")
-                        result    = w.get("result","")
-                        if condition not in ("IS NULL","IS NOT NULL") and value == "":
-                            continue
-                        frag = _sql_when_fragment(src, condition, value, result)
-                        if frag:
-                            fragments.append(frag)
-                    if fragments:
-                        case_expr = f\'CASE {" ".join(fragments)} ELSE {repr(else_v)} END AS "{new_col}"\'
-                        pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(cols)}, {case_expr} FROM {cur_from}")
-                        if new_col not in cols:
-                            cols = cols + [new_col]
-                    else:
-                        tmp=cur_from; step-=1; continue
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "fill_null":
-                fc = [c for c in config.get("columns",[]) if c in cols]
-                ft = config.get("fillType","value")
-                fv = config.get("fillValue","")
-                if not fc:
-                    tmp=cur_from; step-=1; continue
-                elif ft == "value":
-                    sel = ", ".join(
-                        f\'COALESCE("{c}"::TEXT,{repr(str(fv))})::TEXT AS "{c}"\' if c in fc else f\'"{c}"\'
-                        for c in cols
-                    )
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
-                elif ft == "mean":
-                    sel = ", ".join(
-                        f\'COALESCE("{c}", (SELECT AVG("{c}") FROM {cur_from})) AS "{c}"\' if c in fc else f\'"{c}"\'
-                        for c in cols
-                    )
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
-                elif ft == "median":
-                    sel = ", ".join(
-                        f\'COALESCE("{c}", (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY "{c}") FROM {cur_from})) AS "{c}"\'
-                        if c in fc else f\'"{c}"\'
-                        for c in cols
-                    )
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
-                elif ft == "mode":
-                    sel = ", ".join(
-                        f\'COALESCE("{c}", (SELECT "{c}" FROM {cur_from} WHERE "{c}" IS NOT NULL '
-                        f\'GROUP BY "{c}" ORDER BY COUNT(*) DESC LIMIT 1)) AS "{c}"\'
-                        if c in fc else f\'"{c}"\'
-                        for c in cols
-                    )
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
-                elif ft in ("forward","backward"):
-                    # Catatan: correlated subquery -> aman untuk data <50MB (target
-                    # engine ini), tapi tidak scalable untuk data lebih besar.
-                    cmp_op = "<" if ft == "forward" else ">"
-                    order_dir = "DESC" if ft == "forward" else "ASC"
-                    sel_parts = []
-                    for c in cols:
-                        if c in fc:
-                            sel_parts.append(
-                                f\'COALESCE(t1."{c}", (SELECT t2."{c}" FROM {cur_from} t2 \'
-                                f\'WHERE t2.ctid {cmp_op} t1.ctid AND t2."{c}" IS NOT NULL \'
-                                f\'ORDER BY t2.ctid {order_dir} LIMIT 1)) AS "{c}"\'
-                            )
-                        else:
-                            sel_parts.append(f\'t1."{c}"\')
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {\', \'.join(sel_parts)} FROM {cur_from} t1")
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "change_type":
-                types = config.get("types",{})
-                if types:
-                    sel = ", ".join(
-                        f\'CAST("{c}" AS {PG_TYPE.get(types[c],"TEXT")}) AS "{c}"\' if c in types else f\'"{c}"\'
-                        for c in cols
-                    )
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {sel} FROM {cur_from}")
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "order_table":
-                orders = [o for o in config.get("orders",[]) if o.get("col") in cols]
-                if orders:
-                    oc = ", ".join(f\'"{o["col"]}" {o.get("dir","ASC")}\' for o in orders)
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(cols)} FROM {cur_from} ORDER BY {oc}")
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "group_agg":
-                gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
-                if gc and ac:
-                    ae=", ".join(f\'{a["func"]}("{a["col"]}") AS "{a["alias"]}"\' for a in ac)
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(gc)}, {ae} FROM {cur_from} GROUP BY {_q(gc)}")
-                    cols=gc+[a["alias"] for a in ac]
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "join_data":
-                right_table = config.get("rightTable","")
-                left_col    = config.get("leftCol","")
-                right_col   = config.get("rightCol","")
-                if not (right_table and left_col):
-                    tmp=cur_from; step-=1; continue
-                else:
-                    raw_type = config.get("joinType","INNER JOIN").upper()
-                    is_cross = "CROSS" in raw_type
-                    sql_join = "CROSS JOIN" if is_cross else raw_type
-
-                    schema_r, tname_r = right_table.split(".",1) if "." in right_table else ("staging", right_table)
-                    r_cols = [r[0] for r in pg_hook.get_records(f"""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_schema=\'{schema_r}\' AND table_name=\'{tname_r.strip(chr(34))}\'
-                        ORDER BY ordinal_position
-                    """)]
-
-                    dup = [c for c in r_cols if c in cols and c != right_col]
-                    left_sel  = ", ".join(f\'l."{c}"\' for c in cols)
-                    right_sel = ", ".join(
-                        f\'r."{c}" AS "{c}_right"\' if c in dup else f\'r."{c}"\'
-                        for c in r_cols
-                    )
-
-                    if is_cross:
-                        pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {left_sel}, {right_sel} FROM {cur_from} l CROSS JOIN {right_table} r")
-                        cols = cols + [f"{c}_right" if c in dup else c for c in r_cols]
-                    elif right_col:
-                        pg_hook.run(
-                            f"CREATE TABLE {tmp} AS SELECT {left_sel}, {right_sel} "
-                            f\'FROM {cur_from} l {sql_join} {right_table} r ON l."{left_col}" = r."{right_col}"\'
-                        )
-                        cols = cols + [f"{c}_right" if c in dup else c for c in r_cols]
-                    else:
-                        tmp=cur_from; step-=1; continue
-
-            elif ntype == "calc":
-                new_col = (config.get("newColName") or "result").strip()
-                col_a, col_b, op = config.get("colA",""), config.get("colB",""), config.get("operation","+")
-                if new_col and col_a in cols and col_b in cols:
-                    if op == "/":
-                        expr = (f\'CASE WHEN CAST("{col_b}" AS DOUBLE PRECISION) != 0 \'
-                                f\'THEN CAST("{col_a}" AS DOUBLE PRECISION) / CAST("{col_b}" AS DOUBLE PRECISION) \'
-                                f\'ELSE NULL END\')
-                    else:
-                        expr = f\'(CAST("{col_a}" AS DOUBLE PRECISION) {op} CAST("{col_b}" AS DOUBLE PRECISION))\'
-                    pg_hook.run(f\'CREATE TABLE {tmp} AS SELECT {_q(cols)}, {expr} AS "{new_col}" FROM {cur_from}\')
-                    if new_col not in cols:
-                        cols = cols + [new_col]
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "adv_calculator":
-                SCI = {"sin":"SIN","cos":"COS","sqrt":"SQRT","radians":"RADIANS","atan2":"ATAN2","power":"POWER"}
-                exprs, new_cols = [], []
-                for calc in config.get("calculations",[]):
-                    fn    = SCI.get(calc.get("operation","sin"),"SIN")
-                    col_a = calc.get("colA",""); col_b = calc.get("colB","")
-                    new_c = (calc.get("newColName") or "").strip()
-                    if not new_c or col_a not in cols:
-                        continue
-                    if fn in ("ATAN2","POWER") and col_b in cols:
-                        exprs.append(f\'{fn}(CAST("{col_a}" AS DOUBLE PRECISION), CAST("{col_b}" AS DOUBLE PRECISION)) AS "{new_c}"\')
-                    else:
-                        exprs.append(f\'{fn}(CAST("{col_a}" AS DOUBLE PRECISION)) AS "{new_c}"\')
-                    new_cols.append(new_c)
-                if exprs:
-                    pg_hook.run(f"CREATE TABLE {tmp} AS SELECT {_q(cols)}, {\', \'.join(exprs)} FROM {cur_from}")
-                    cols = cols + new_cols
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            elif ntype == "combine_cols":
-                new_col = (config.get("newColName") or "combined").strip()
-                sep     = config.get("separator"," ")
-                selected = [c for c in config.get("selectedCols",[]) if c in cols]
-                remove_orig = config.get("removeOriginal", False)
-                if new_col and selected:
-                    concat_expr = f\' || {repr(sep)} || \'.join(
-                        f\'COALESCE(CAST("{c}" AS TEXT), \\\'\\\')\' for c in selected
-                    )
-                    keep = [c for c in cols if not (remove_orig and c in selected)]
-                    pg_hook.run(f\'CREATE TABLE {tmp} AS SELECT {_q(keep)}, ({concat_expr}) AS "{new_col}" FROM {cur_from}\')
-                    cols = keep + [new_col]
-                else:
-                    tmp=cur_from; step-=1; continue
-
-            else:
-                tmp=cur_from; step-=1; continue
-
-        except Exception as e:
-            print(f"[PG] step {step} {ntype}: {e}")
-            tmp=cur_from; step-=1
-
-        if tmp != cur_from:
-            cur_from = tmp
-
-    pg_hook.run(f"DROP TABLE IF EXISTS {out_table}")
-    pg_hook.run(f"CREATE TABLE {out_table} AS SELECT {_q(cols)}, NOW() AS loaded_at FROM {cur_from}")
-
-    for r in pg_hook.get_records(f"""
-        SELECT table_name FROM information_schema.tables
-        WHERE table_schema=\'staging\' AND table_name LIKE \'_etl_{task_id}_s%\'
-    """):
-        pg_hook.run(f\'DROP TABLE IF EXISTS staging."{r[0]}"\')
 
 # ── Spark Runner ──────────────────────────────────────────────────────────────
 
@@ -1513,68 +514,47 @@ def run(run_ids, backend_url=BACKEND_URL):
     tbl      = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{INPUT_TABLE}"
     safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',OUTPUT_NAME.lower()).strip(\'_\') or "output"
 
-    pg_tmp  = _get_conn()
-    size_mb = _estimate_mb(pg_tmp, tbl)
-    pg_tmp.close()
+    print(f"[Task:{TASK_ID}] engine=spark (single-engine architecture)")
 
-    if size_mb < 50:
-        engine = "postgres"
-    elif size_mb < 5000:
-        engine = "duckdb"
-    else:
-        try:
-            import importlib.util
-            engine = "spark" if importlib.util.find_spec("pyspark") else "duckdb"
-        except Exception:
-            engine = "duckdb"
+    def _report(status, pct, msg, row_count=None):
+        for run_id in run_ids:
+            try:
+                payload = {"status": status, "progress_pct": pct, "message": msg}
+                if row_count is not None:
+                    payload["row_count"] = row_count
+                requests.patch(
+                    f"{backend_url}/api/pipelines/runs/{run_id}",
+                    json=payload,
+                    timeout=5,
+                )
+            except Exception: pass
 
-    print(f"[Task:{TASK_ID}] {size_mb:.1f}MB | engine={engine}")
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+    pg_hook = PostgresHook(postgres_conn_id="postgres_default")
 
-    last_pct = [0]
-    def progress(pct, msg):
-        if pct - last_pct[0] >= 10:
-            last_pct[0] = pct
-            for run_id in run_ids:
-                try:
-                    requests.patch(
-                        f"{backend_url}/api/pipelines/runs/{run_id}",
-                        json={"status":"running","progress_pct":pct,"message":msg},
-                        timeout=3,
-                    )
-                except Exception: pass
-
-    if engine == "duckdb":
-        result = _run_duckdb(tbl, safe_out, TRANSFORMS, progress_cb=progress)
-        rows   = result.get("rows", 0)
-    elif engine == "spark":
-        from airflow.providers.postgres.hooks.postgres import PostgresHook
-        pg_hook   = PostgresHook(postgres_conn_id="postgres_default")
+    try:
         row_count = pg_hook.get_first(f"SELECT COUNT(*) FROM {tbl}")[0]
+    except Exception as e:
+        err = f"Failed to read input table {tbl}: {e}"
+        print(f"[Task:{TASK_ID}] {err}")
+        _report("failed", 0, err)
+        raise
+
+    try:
         _run_spark(tbl, safe_out, TRANSFORMS, row_count)
+    except Exception as e:
+        err = f"Spark execution failed: {e}"
+        print(f"[Task:{TASK_ID}] {err}\\n{traceback.format_exc()}")
+        _report("failed", 0, err)
+        raise
+
+    try:
         rows = pg_hook.get_first(f\'SELECT COUNT(*) FROM warehouse."{safe_out}"\')[0]
-    else:
-        from airflow.providers.postgres.hooks.postgres import PostgresHook
-        pg_hook   = PostgresHook(postgres_conn_id="postgres_default")
-        row_count = pg_hook.get_first(f"SELECT COUNT(*) FROM {tbl}")[0]
-        _run_postgres(pg_hook, tbl, safe_out, TRANSFORMS, TASK_ID)
-        try: rows = pg_hook.get_first(f\'SELECT COUNT(*) FROM warehouse."{safe_out}"\')[0]
-        except Exception: rows = 0
+    except Exception:
+        rows = 0
 
-    for run_id in run_ids:
-        try:
-            requests.patch(
-                f"{backend_url}/api/pipelines/runs/{run_id}",
-                json={
-                    "status":"success", "row_count":rows,
-                    "progress_pct":100,
-                    "message":f"Done: {rows:,} rows via {engine}",
-                },
-                timeout=5,
-            )
-        except Exception as e:
-            print(f"[Task:{TASK_ID}] Backend update failed: {e}")
-
-    print(f"[Task:{TASK_ID}] Done → warehouse.{safe_out} ({rows:,} rows via {engine})")
+    _report("success", 100, f"Done: {rows:,} rows via spark", row_count=rows)
+    print(f"[Task:{TASK_ID}] Done → warehouse.{safe_out} ({rows:,} rows via spark)")
     return rows
 '''
 
@@ -1663,6 +643,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import requests
+sys.path.insert(0, os.path.dirname(__file__))
+
 
 # ── Import task modules ───────────────────────────────────────────────────────
 {imports_block}
@@ -2598,9 +1580,292 @@ def preview_spark_pipeline(payload: dict):
 # TRANSFORM PREVIEW (DuckDB-powered, instant)
 # ════════════════════════════════════════════════════════════════════════════
 
+def _spark_when_condition_main(F, col, condition, value):
+    """Mirror of the Spark condition builder used in generated task files, for preview parity."""
+    c = F.col(col)
+    if condition == '=':
+        return c == value
+    if condition == '!=':
+        return c != value
+    if condition in ('>', '>=', '<', '<='):
+        num = float(value)
+        c_num = c.cast('double')
+        return {'>': c_num > num, '>=': c_num >= num,
+                '<': c_num < num, '<=': c_num <= num}[condition]
+    if condition == 'LIKE':
+        return c.like(value)
+    if condition == 'IS NULL':
+        return c.isNull()
+    if condition == 'IS NOT NULL':
+        return c.isNotNull()
+    if condition == 'IN':
+        vals = [v.strip() for v in str(value).split(',')]
+        return c.isin(*vals)
+    if condition == 'NOT IN':
+        vals = [v.strip() for v in str(value).split(',')]
+        return ~c.isin(*vals)
+    return c == value
+
+
+def apply_spark_transforms(df, transforms, spark, get_right_df=None):
+    """
+    Apply the pipeline's transform list to a Spark DataFrame using the PySpark
+    DataFrame API. This is the single, canonical transform implementation used
+    by BOTH Preview Pipeline and Run Pipeline (via the generated task files),
+    so results are always identical across the two.
+
+    get_right_df(table_name) -> Spark DataFrame, used to resolve join_data's right table.
+    Raises RuntimeError with a clear message on any transform error (no silent skips).
+    """
+    from pyspark.sql import functions as F, Window
+
+    TYPE_MAP = {
+        'TEXT': 'string', 'INTEGER': 'int', 'BIGINT': 'bigint',
+        'NUMERIC': 'double', 'BOOLEAN': 'boolean',
+        'DATE': 'date', 'TIMESTAMP': 'timestamp', 'VARCHAR(255)': 'string',
+    }
+
+    for i, tx in enumerate(transforms):
+        ntype = tx.get("type", "")
+        cfg   = tx.get("config") or {}
+        try:
+            if ntype == "filter_rows":
+                formula = cfg.get("formula", "1=1")
+                df = df.filter(F.expr(formula))
+
+            elif ntype == "select_col":
+                cols = [c for c in cfg.get("columns", []) if c in df.columns]
+                missing = [c for c in cfg.get("columns", []) if c not in df.columns]
+                if missing:
+                    raise RuntimeError(f"Column(s) not found: {', '.join(missing)}")
+                if cols:
+                    df = df.select(*cols)
+
+            elif ntype == "drop_col":
+                drop = cfg.get("columns", [])
+                df = df.drop(*[c for c in drop if c in df.columns])
+
+            elif ntype == "rename_col":
+                for o, n in cfg.get("renames", {}).items():
+                    if o not in df.columns:
+                        raise RuntimeError(f"Column not found for rename: {o}")
+                    df = df.withColumnRenamed(o, n)
+
+            elif ntype == "add_const":
+                name  = cfg.get("name", "new_col")
+                val   = cfg.get("value", "")
+                dtype = TYPE_MAP.get(cfg.get("dtype", "TEXT"), "string")
+                df = df.withColumn(name, F.lit(val).cast(dtype))
+
+            elif ntype == "set_val":
+                target = cfg.get("targetCol")
+                if not target:
+                    raise RuntimeError("Set Column Value: targetCol is required")
+                if cfg.get("useExpr"):
+                    df = df.withColumn(target, F.expr(cfg.get("expr", target)))
+                else:
+                    src = cfg.get("sourceCol", target)
+                    if src not in df.columns:
+                        raise RuntimeError(f"Set Column Value: source column not found: {src}")
+                    df = df.withColumn(target, F.col(src))
+
+            elif ntype == "val_mapper":
+                src     = cfg.get("sourceCol")
+                new_col = cfg.get("newColName", "mapped")
+                whens   = cfg.get("whens", [])
+                else_v  = cfg.get("elseValue", "")
+                if not src or src not in df.columns:
+                    raise RuntimeError(f"Value Mapper: source column not found: {src}")
+                expr = None
+                for w in whens:
+                    condition = w.get("condition", "=")
+                    value     = w.get("value", "")
+                    result    = w.get("result", "")
+                    if condition not in ("IS NULL", "IS NOT NULL") and value == "":
+                        continue
+                    cond_expr = _spark_when_condition_main(F, src, condition, value)
+                    expr = F.when(cond_expr, F.lit(result)) if expr is None else expr.when(cond_expr, F.lit(result))
+                df = df.withColumn(new_col, expr.otherwise(F.lit(else_v)) if expr is not None else F.lit(else_v))
+
+            elif ntype == "fill_null":
+                fc = [c for c in cfg.get("columns", []) if c in df.columns]
+                ft = cfg.get("fillType", "value")
+                fv = cfg.get("fillValue", "")
+                if fc:
+                    if ft == "value":
+                        df = df.fillna(fv, subset=fc)
+                    elif ft == "mean":
+                        stats = df.select([F.mean(F.col(c)).alias(c) for c in fc]).collect()[0].asDict()
+                        stats = {k: v for k, v in stats.items() if v is not None}
+                        if stats: df = df.fillna(stats)
+                    elif ft == "median":
+                        meds = {}
+                        for c in fc:
+                            q = df.approxQuantile(c, [0.5], 0.001)
+                            if q: meds[c] = q[0]
+                        if meds: df = df.fillna(meds)
+                    elif ft == "mode":
+                        modes = {}
+                        for c in fc:
+                            row = (df.filter(F.col(c).isNotNull()).groupBy(c).count()
+                                     .orderBy(F.desc("count")).limit(1).collect())
+                            if row: modes[c] = row[0][c]
+                        if modes: df = df.fillna(modes)
+                    elif ft in ("forward", "backward"):
+                        df = df.withColumn("_rn", F.monotonically_increasing_id())
+                        if ft == "forward":
+                            win = Window.orderBy("_rn").rowsBetween(Window.unboundedPreceding, 0)
+                            fn = F.last
+                        else:
+                            win = Window.orderBy("_rn").rowsBetween(0, Window.unboundedFollowing)
+                            fn = F.first
+                        for c in fc:
+                            df = df.withColumn(c, fn(F.col(c), ignorenulls=True).over(win))
+                        df = df.drop("_rn")
+
+            elif ntype == "change_type":
+                for col, dtype in (cfg.get("types") or {}).items():
+                    if col not in df.columns:
+                        raise RuntimeError(f"Change Type: column not found: {col}")
+                    df = df.withColumn(col, F.col(col).cast(TYPE_MAP.get(dtype, "string")))
+
+            elif ntype == "order_table":
+                orders = cfg.get("orders", [])
+                cols = [
+                    F.col(o["col"]).asc() if o.get("dir", "ASC") == "ASC" else F.col(o["col"]).desc()
+                    for o in orders if o.get("col") in df.columns
+                ]
+                if cols:
+                    df = df.orderBy(*cols)
+
+            elif ntype == "group_agg":
+                gc = [c for c in cfg.get("groupCols", []) if c in df.columns]
+                ac = cfg.get("aggCols", [])
+                if not gc or not ac:
+                    raise RuntimeError("Group By: groupCols and aggCols are required")
+                fn_map = {
+                    "COUNT": F.count, "SUM": F.sum, "AVG": F.avg,
+                    "MIN": F.min, "MAX": F.max, "COUNT DISTINCT": F.countDistinct,
+                }
+                aggs = []
+                for a in ac:
+                    if a.get("col") not in df.columns:
+                        raise RuntimeError(f"Group By: aggregate column not found: {a.get('col')}")
+                    aggs.append(fn_map.get(a["func"], F.count)(a["col"]).alias(a.get("alias", f'{a["col"]}_{a["func"].lower()}')))
+                df = df.groupBy(*gc).agg(*aggs)
+
+            elif ntype == "calc":
+                new_col = (cfg.get("newColName") or "result").strip()
+                col_a, col_b, op = cfg.get("colA"), cfg.get("colB"), cfg.get("operation", "+")
+                if col_a not in df.columns or col_b not in df.columns:
+                    raise RuntimeError(f"Calculator: column not found ({col_a}, {col_b})")
+                a, b = F.col(col_a).cast("double"), F.col(col_b).cast("double")
+                expr = {"+": a + b, "-": a - b, "*": a * b, "/": F.when(b != 0, a / b)}.get(op, a + b)
+                df = df.withColumn(new_col, expr)
+
+            elif ntype == "adv_calculator":
+                SCI = {"sin": F.sin, "cos": F.cos, "sqrt": F.sqrt,
+                       "radians": F.radians, "atan2": F.atan2, "power": F.pow}
+                for calc in cfg.get("calculations", []):
+                    fn    = SCI.get(calc.get("operation", "sin"), F.sin)
+                    new_c = (calc.get("newColName") or "").strip()
+                    col_a, col_b = calc.get("colA"), calc.get("colB")
+                    if not new_c or col_a not in df.columns:
+                        continue
+                    if calc.get("operation") in ("atan2", "power") and col_b in df.columns:
+                        df = df.withColumn(new_c, fn(F.col(col_a).cast("double"), F.col(col_b).cast("double")))
+                    else:
+                        df = df.withColumn(new_c, fn(F.col(col_a).cast("double")))
+
+            elif ntype == "combine_cols":
+                new_col     = (cfg.get("newColName") or "combined").strip()
+                sep         = cfg.get("separator", " ")
+                selected    = [c for c in cfg.get("selectedCols", []) if c in df.columns]
+                remove_orig = cfg.get("removeOriginal", False)
+                if not selected:
+                    raise RuntimeError("Combine Columns: no valid columns selected")
+                parts = [F.coalesce(F.col(c).cast("string"), F.lit("")) for c in selected]
+                combined = parts[0]
+                for p in parts[1:]:
+                    combined = F.concat(combined, F.lit(sep), p)
+                df = df.withColumn(new_col, combined)
+                if remove_orig:
+                    df = df.drop(*selected)
+
+            elif ntype == "join_data":
+                right_table = cfg.get("rightTable")
+                left_col    = cfg.get("leftCol")
+                right_col   = cfg.get("rightCol")
+                if not right_table or not left_col:
+                    raise RuntimeError("Join: rightTable and leftCol are required")
+                if get_right_df is None:
+                    raise RuntimeError("Join: right table resolver not available")
+                right_df = get_right_df(right_table)
+
+                raw_type  = cfg.get("joinType", "INNER JOIN").upper()
+                is_cross  = "CROSS" in raw_type
+                join_type = raw_type.replace(" JOIN", "").lower().replace("full outer", "outer")
+
+                dup_cols = [c for c in right_df.columns if c in df.columns and c != right_col]
+                for c in dup_cols:
+                    right_df = right_df.withColumnRenamed(c, f"{c}_right")
+
+                if is_cross:
+                    df = df.crossJoin(right_df)
+                else:
+                    if not right_col:
+                        raise RuntimeError("Join: rightCol is required for non-cross joins")
+                    if left_col not in df.columns or right_col not in right_df.columns:
+                        raise RuntimeError(f"Join: column not found ({left_col} / {right_col})")
+                    df = df.join(right_df, df[left_col] == right_df[right_col], join_type)
+
+            elif ntype == "pyspark":
+                code = cfg.get("code", "")
+                if code:
+                    ns = {"df": df, "spark": spark, "F": F}
+                    try:
+                        exec(code, ns)
+                    except Exception as e:
+                        raise RuntimeError(f"PySpark node error: {e}")
+                    df = ns.get("df", df)
+
+            else:
+                continue
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Step {i+1} ({ntype}) failed: {e}")
+
+    return df
+
+
+_preview_spark_session = None
+
+
+def _get_preview_spark():
+    """Reuse a single lightweight local Spark session for fast previews."""
+    global _preview_spark_session
+    if _preview_spark_session is None:
+        from pyspark.sql import SparkSession
+        _preview_spark_session = (
+            SparkSession.builder
+            .appName("ETLFlow_Preview")
+            .master("local[*]")
+            .config("spark.sql.shuffle.partitions", "4")
+            .config("spark.ui.showConsoleProgress", "false")
+            .getOrCreate()
+        )
+    return _preview_spark_session
+
+
 @app.post("/api/preview/transform")
 def preview_transform(payload: dict):
-    """Preview transform result — uses DuckDB if available (much faster)."""
+    """
+    Preview transform result using Apache Spark — the same engine and the same
+    transform implementations (apply_spark_transforms) used by Run Pipeline,
+    so preview results are always identical to the DAG's actual output.
+    """
     dataset_id = payload.get("dataset_id")
     transforms = payload.get("transforms", [])
     limit      = payload.get("limit", 50)
@@ -2615,122 +1880,41 @@ def preview_transform(payload: dict):
         table_name = ds["table_name"]
         tbl        = f'staging."{table_name}"'
 
-        if _duckdb_available():
-            import duckdb
-            sample_df = pd.read_sql(f"SELECT * FROM {tbl} LIMIT 5000", conn)
-            dcon      = duckdb.connect(":memory:")
-            dcon.register("_input", sample_df)
+        try:
+            sample_pdf = pd.read_sql(f"SELECT * FROM {tbl} LIMIT 5000", conn)
+        except Exception as e:
+            raise HTTPException(400, f"Failed to read dataset: {e}")
 
-            # ── Baca & register tabel kanan untuk join_data ──────────────
-            right_tables = {}
-            for idx, tx in enumerate(transforms):
-                if tx.get("type") == "join_data":
-                    r_table = (tx.get("config") or {}).get("rightTable")
-                    if r_table and r_table not in right_tables:
-                        r_df = pd.read_sql(f"SELECT * FROM {r_table} LIMIT 5000", conn)
-                        r_alias = f"_right_{idx}"
-                        dcon.register(r_alias, r_df)
-                        right_tables[r_table] = {"alias": r_alias, "columns": list(r_df.columns)}
+        spark = _get_preview_spark()
+        try:
+            df = spark.createDataFrame(sample_pdf.astype(object).where(pd.notnull(sample_pdf), None))
+        except Exception as e:
+            raise HTTPException(400, f"Failed to load data into Spark: {e}")
 
-            sql    = _build_duckdb_sql("_input", transforms, limit=limit, right_tables=right_tables)
-            result = dcon.execute(sql).df()
-            dcon.close()
-            return {"columns": list(result.columns), "rows": result.to_dict(orient="records")}
-            schema_cur = conn.cursor()
-        schema_cur.execute(f"""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_schema='staging' AND table_name='{table_name}'
-            ORDER BY ordinal_position
-        """)
-        cur_cols   = [r[0] for r in schema_cur.fetchall()]
-        current    = tbl
-        cte_parts  = []
-        step       = 0
+        right_df_cache = {}
 
-        for tx in transforms:
-            ntype  = tx.get("type",""); config = tx.get("config") or {}
-            step  += 1; alias = f"step_{step}"
-            prev   = f"step_{step-1}" if step > 1 else current
+        def get_right_df(right_table: str):
+            if right_table in right_df_cache:
+                return right_df_cache[right_table]
             try:
-                if   ntype == "filter_rows":
-                    cte_parts.append(f"{alias} AS (SELECT * FROM {prev} WHERE {config.get('formula','1=1')})")
-                elif ntype == "select_col":
-                    cols = [c for c in config.get("columns", cur_cols) if c in cur_cols]
-                    if cols:
-                        cte_parts.append(f"{alias} AS (SELECT {_q(cols)} FROM {prev})")
-                        cur_cols = cols
-                    else: step -= 1; continue
-                elif ntype == "drop_col":
-                    keep = [c for c in cur_cols if c not in set(config.get("columns",[]))]
-                    cte_parts.append(f"{alias} AS (SELECT {_q(keep)} FROM {prev})")
-                    cur_cols = keep
-                elif ntype == "rename_col":
-                    rn   = config.get("renames",{})
-                    ex   = ", ".join(f'"{c}" AS "{rn.get(c,c)}"' for c in cur_cols)
-                    cte_parts.append(f"{alias} AS (SELECT {ex} FROM {prev})")
-                    cur_cols = [rn.get(c,c) for c in cur_cols]
-                elif ntype == "group_agg":
-                    gc=config.get("groupCols",[]); ac=config.get("aggCols",[])
-                    if gc and ac:
-                        ae=", ".join(f'{a["func"]}("{a["col"]}") AS "{a["alias"]}"' for a in ac)
-                        cte_parts.append(f"{alias} AS (SELECT {_q(gc)}, {ae} FROM {prev} GROUP BY {_q(gc)})")
-                        cur_cols = gc + [a["alias"] for a in ac]
-                    else: step -= 1; continue
-
-                elif ntype == "join_data":
-                    right_table = config.get("rightTable", "")
-                    left_col    = config.get("leftCol", "")
-                    right_col   = config.get("rightCol", "")
-                    if not (right_table and left_col):
-                        step -= 1; continue
-
-                    schema_r, tname_r = right_table.split(".", 1) if "." in right_table else ("staging", right_table)
-                    tname_r_clean = tname_r.strip('"')
-                    r_cur = conn.cursor()
-                    r_cur.execute("""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_schema = %s AND table_name = %s
-                        ORDER BY ordinal_position
-                    """, (schema_r, tname_r_clean))
-                    r_cols = [r[0] for r in r_cur.fetchall()]
-                    r_cur.close()
-
-                    raw_type = config.get("joinType", "INNER JOIN").upper()
-                    is_cross = "CROSS" in raw_type
-                    sql_join = "CROSS JOIN" if is_cross else raw_type
-
-                    dup = [c for c in r_cols if c in cur_cols and c != right_col]
-                    left_select  = ", ".join(f'l."{c}"' for c in cur_cols)
-                    right_select = ", ".join(
-                        f'r."{c}" AS "{c}_right"' if c in dup else f'r."{c}"'
-                        for c in r_cols
-                    )
-
-                    if is_cross:
-                        cte_parts.append(
-                            f"{alias} AS (SELECT {left_select}, {right_select} FROM {prev} l CROSS JOIN {right_table} r)"
-                        )
-                    elif right_col:
-                        cte_parts.append(
-                            f'{alias} AS (SELECT {left_select}, {right_select} '
-                            f'FROM {prev} l {sql_join} {right_table} r ON l."{left_col}" = r."{right_col}")'
-                        )
-                    else:
-                        step -= 1; continue
-
-                    cur_cols = cur_cols + [f"{c}_right" if c in dup else c for c in r_cols]
-
-                else: step -= 1; continue
+                r_pdf = pd.read_sql(f"SELECT * FROM {right_table} LIMIT 5000", conn)
             except Exception as e:
-                cte_parts.append(f"{alias} AS (SELECT * FROM {prev})")
+                raise RuntimeError(f"Join: could not read right table {right_table}: {e}")
+            r_df = spark.createDataFrame(r_pdf.astype(object).where(pd.notnull(r_pdf), None))
+            right_df_cache[right_table] = r_df
+            return r_df
 
-        last = f"step_{step}" if cte_parts else current
-        sql  = (f"WITH {', '.join(cte_parts)} SELECT * FROM {last} LIMIT {limit}"
-                if cte_parts else f"SELECT * FROM {current} LIMIT {limit}")
-        cur.execute(sql)
-        rows    = cur.fetchall()
-        columns = [d[0] for d in cur.description]
-        return {"columns": columns, "rows": [dict(r) for r in rows]}
+        try:
+            result_df = apply_spark_transforms(df, transforms, spark, get_right_df=get_right_df)
+            result_df = result_df.limit(limit)
+            rows = [row.asDict(recursive=True) for row in result_df.collect()]
+            columns = result_df.columns
+        except RuntimeError as e:
+            raise HTTPException(400, f"Preview failed: {e}")
+        except Exception as e:
+            raise HTTPException(400, f"Preview failed: {e}\n{traceback.format_exc()}")
+
+        return {"columns": columns, "rows": rows}
 
     except HTTPException: raise
     except Exception as e: raise HTTPException(400, f"Preview failed: {e}")
