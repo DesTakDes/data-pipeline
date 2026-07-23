@@ -36,3 +36,5 @@ export const runNewPipeline = (payload) => api.post('/pipelines/run', payload);
 
 // 3. Tambahkan fungsi untuk Polling Status DAG yang sebelumnya hilang
 export const getDagStatus = (runId) => api.get(`/pipelines/runs/${runId}/dag-status`);
+export const getSparkResourceRecommendation = (params) => api.get('/spark/resource-recommendation', { params });
+export const postSparkRuntimeConfig = (payload) => api.post('/spark/runtime-config', payload);

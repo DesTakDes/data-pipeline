@@ -157,6 +157,7 @@ def build_spark_session_config(resource_config: Optional[Dict[str, Any]] = None,
         "spark.kryo.registrationRequired": "false",
         "spark.memory.fraction": str(cfg.get("memory_fraction", 0.6)),
         "spark.memory.storageFraction": str(cfg.get("storage_fraction", 0.5)),
+        "spark.hadoop.fs.permissions.umask-mode": "000",
     }
 
 

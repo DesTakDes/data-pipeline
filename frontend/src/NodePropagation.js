@@ -202,7 +202,11 @@ export function getUpstreamColumns(nodeId, nodes, edges) {
  */
 export function isValidNodeConnection(sourceType, targetType) {
   // Definisikan semua tipe utility node
-  const utilityTypes = ["select_col", "rename_col", "drop_col", "add_const", "set_val", "val_mapper", "change_type", "fill_null", "filter_rows", "order_table", "group_agg", "join_data", "pyspark"];
+  const utilityTypes = [
+    "select_col", "rename_col", "drop_col", "add_const", "set_val", "val_mapper",
+    "change_type", "fill_null", "filter_rows", "order_table", "group_agg",
+    "join_data", "pyspark", "calc", "adv_calculator", "combine_cols"
+  ];
 
   // Output dataset tidak boleh mengeluarkan koneksi
   if (sourceType === "output_dataset") {

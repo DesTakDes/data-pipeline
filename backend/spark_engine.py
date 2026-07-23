@@ -47,8 +47,11 @@ def _pg_table_size_mb(table: str) -> float:
     import psycopg2
     try:
         conn = psycopg2.connect(
-            host="postgres", port=5432, database="airflow",
-            user="airflow", password="airflow",
+            host=os.getenv("POSTGRES_HOST", "postgres"),
+            port=int(os.getenv("POSTGRES_PORT", 5432)),
+            database=os.getenv("POSTGRES_DB", "airflow"),
+            user=os.getenv("POSTGRES_USER", "airflow"),
+            password=os.getenv("POSTGRES_PASSWORD", "airflow"),
         )
         cur = conn.cursor()
         cur.execute("SELECT pg_total_relation_size(%s) / 1024.0 / 1024.0", (table,))
@@ -239,8 +242,15 @@ def clear_cache():
 # 4. TRANSFORM PER NODE — Spark native
 # ════════════════════════════════════════════════════════════════════════════
 
-def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup):
-    """Terapkan satu transform utility node ke Spark DataFrame."""
+def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup, right_size_lookup=None):
+    """
+    Terapkan satu transform utility node ke Spark DataFrame.
+
+    right_size_lookup: callable(right_node_id) -> float (MB), dipakai untuk
+    keputusan broadcast join di node join_data. Opsional (default None)
+    supaya caller lama yang hanya mengirim 5 argumen (mis. task file hasil
+    generate_task_file di main.py) tetap kompatibel.
+    """
     from pyspark.sql import functions as F
 
     ntype  = node["data"]["type"]
@@ -279,7 +289,15 @@ def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup)
             return df
         expr = None
         for w in whens:
-            cond = F.col(src) == w.get("value")
+            condition = w.get("condition", "=")
+            # IS NULL / IS NOT NULL tidak butuh value; selain itu wajib ada value.
+            if condition not in ("IS NULL", "IS NOT NULL") and not w.get("value"):
+                continue
+            try:
+                cond = _build_when_condition(src, condition, w.get("value"))
+            except Exception as e:
+                print(f"[SparkEngine] val_mapper: kondisi tidak valid ({condition}): {e} — dilewati")
+                continue
             expr = F.when(cond, F.lit(w.get("result"))) if expr is None else expr.when(cond, F.lit(w.get("result")))
         expr = expr.otherwise(F.lit(else_v)) if expr is not None else F.lit(else_v)
         return df.withColumn(new_col, expr)
@@ -331,7 +349,9 @@ def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup)
                      .replace(" JOIN", "").lower().replace("full outer", "outer"))
 
         # Broadcast tabel kanan yang kecil -> hindari shuffle join sama sekali.
-        right_size_mb = _estimate_df_size_mb(right_df)
+        # Ukuran diambil dari right_size_lookup (mis. pg_total_relation_size),
+        # bukan dengan menghitung df secara langsung (mahal & bisa trigger job).
+        right_size_mb = right_size_lookup(config.get("rightNodeId")) if right_size_lookup else BROADCAST_MAX_MB + 1
         if right_size_mb <= BROADCAST_MAX_MB:
             right_df = F.broadcast(right_df)
             print(f"[SparkEngine] join_data: broadcast tabel kanan (~{right_size_mb:.1f} MB)")
@@ -406,12 +426,15 @@ def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup)
 
 def read_source_once(spark, table: str):
     """Baca tabel staging via JDBC — dipanggil SEKALI, hasilnya dipakai ulang."""
-    jdbc_url = "jdbc:postgresql://postgres:5432/airflow"
+    pg_host = os.getenv("POSTGRES_HOST", "postgres")
+    pg_port = os.getenv("POSTGRES_PORT", "5432")
+    pg_db   = os.getenv("POSTGRES_DB", "airflow")
+    jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
     return (spark.read.format("jdbc")
             .option("url", jdbc_url)
             .option("dbtable", f"(SELECT * FROM {table}) AS t")
-            .option("user", "airflow")
-            .option("password", "airflow")
+            .option("user", os.getenv("POSTGRES_USER", "airflow"))
+            .option("password", os.getenv("POSTGRES_PASSWORD", "airflow"))
             .option("driver", "org.postgresql.Driver")
             .load())
 

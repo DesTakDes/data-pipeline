@@ -12,6 +12,7 @@ import {
   saveWorkflow   as saveWfToCache,
   deleteWorkflow as deleteWfFromCache,
 } from "./workflowCache";
+import { getSparkResourceRecommendation, postSparkRuntimeConfig } from "./api";
 
 const api = axios.create({ baseURL: "/api" });
 
@@ -446,6 +447,22 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
   const [outputSidebarNodeId, setOutputSidebarNodeId] = useState(null);
   const [inputConfig, setInputConfig]   = useState({ datasetId: "" });
   const [outputConfig, setOutputConfig] = useState({ outputName: "", description: "", taskId: "" });
+  const [resourceModalOpen, setResourceModalOpen] = useState(false);
+  const [resourceConfig, setResourceConfig] = useState({
+    driver_memory: "2g",
+    driver_cores: 1,
+    executor_memory: "4g",
+    executor_cores: 2,
+    num_executors: 2,
+    min_executors: 1,
+    initial_executors: 2,
+    max_executors: 3,
+    shuffle_partitions: 64,
+    default_parallelism: 64,
+    dynamic_allocation: true,
+    aqe_enabled: true,
+  });
+  const [resourceRecommendation, setResourceRecommendation] = useState(null);
   const pollRef = useRef(null);
   
   const columnMap = useMemo(() => computeNodeColumns(nodes, edges), [nodes, edges]);
@@ -604,6 +621,24 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     });
   }, [nodes, edges]);
 
+  const applySparkResourceConfig = async () => {
+    try {
+      const input = nodes.find(n => n.data.type === "input_dataset")?.data?.config?.dataset;
+      const payload = {
+        file_size_bytes: input?.file_size_bytes || 0,
+        row_count: input?.row_count || 0,
+        col_count: input?.columns?.length || 0,
+      };
+      const res = await getSparkResourceRecommendation(payload);
+      setResourceRecommendation(res.data);
+      setResourceConfig({ ...resourceConfig, ...res.data.recommendation });
+      await postSparkRuntimeConfig(res.data.recommendation);
+      toast("Spark resources applied", "success");
+    } catch (e) {
+      toast("Failed to apply Spark resources", "error");
+    }
+  };
+
   const handleRun = async () => {
     const inputNodes  = nodes.filter(n => n.data.type === "input_dataset");
     const outputNodes = nodes.filter(n => n.data.type === "output_dataset");
@@ -620,6 +655,19 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     const input = inputNodes[0].data.config.dataset;
     const tasks = buildTasks();
     const inputTable = input.table_name ? `staging.${input.table_name}` : `staging.${input.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g,'_')}`;
+
+    try {
+      const profilePayload = {
+        file_size_bytes: input?.file_size_bytes || 0,
+        row_count: input?.row_count || 0,
+        col_count: input?.columns?.length || 0,
+      };
+      const recRes = await getSparkResourceRecommendation(profilePayload);
+      const nextConfig = { ...resourceConfig, ...(recRes.data?.recommendation || {}) };
+      setResourceRecommendation(recRes.data);
+      setResourceConfig(nextConfig);
+      await postSparkRuntimeConfig(nextConfig);
+    } catch {}
 
     setRunning(true);
     try {
@@ -699,6 +747,9 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
           )}
           <button onClick={handleSave} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 14px", borderRadius: 7, border: `1px solid ${C.g200}`, background: C.white, cursor: "pointer", fontSize: 12, fontWeight: 600, color: C.g600 }}>
             <Ic.Save /> Save
+          </button>
+          <button onClick={() => setResourceModalOpen(true)} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 14px", borderRadius: 7, border: `1px solid ${C.spark}33`, background: C.sparkTint, color: C.spark, cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+            <Ic.Spark /> Resources
           </button>
           <button onClick={handleRun} disabled={running} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 16px", borderRadius: 7, background: running ? C.g300 : `linear-gradient(135deg,${C.spark},${C.blue})`, border: "none", cursor: running ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 700, color: C.white, boxShadow: running ? "none" : `0 2px 12px ${C.blue}55` }}>
             <Ic.Spark /> {running ? "Running…" : "Run Spark Pipeline"}
@@ -936,6 +987,56 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
           )}
         </div>
       </div>
+
+      {/* Spark Resource Modal */}
+      {resourceModalOpen && (
+        <Modal title="Spark Runtime Settings" onClose={() => setResourceModalOpen(false)} width={560}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ background: C.sparkTint, border: `1px solid ${C.spark}22`, borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 12, fontWeight: 800, color: C.spark, marginBottom: 6 }}>Auto-tune Spark for the selected dataset</div>
+              <div style={{ fontSize: 11, color: C.g600, lineHeight: 1.5 }}>
+                The backend will estimate dataset size and apply executor, memory, shuffle, and AQE settings before the pipeline runs.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={applySparkResourceConfig} style={{ flex: 1, padding: "9px 0", borderRadius: 8, background: `linear-gradient(90deg,${C.spark},${C.orange})`, color: C.white, fontSize: 12, fontWeight: 700, border: "none", cursor: "pointer" }}>
+                Recommend & Apply
+              </button>
+              <button onClick={() => setResourceModalOpen(false)} style={{ padding: "9px 14px", borderRadius: 8, border: `1px solid ${C.g200}`, background: C.white, color: C.g600, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                Close
+              </button>
+            </div>
+            {resourceRecommendation && (
+              <div style={{ border: `1px solid ${C.g200}`, borderRadius: 10, padding: 12, background: C.g50 }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: C.g700, marginBottom: 8 }}>Recommended values</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, fontSize: 11, color: C.g600 }}>
+                  <div><b>Driver memory:</b> {resourceRecommendation.recommendation?.driver_memory}</div>
+                  <div><b>Executor memory:</b> {resourceRecommendation.recommendation?.executor_memory}</div>
+                  <div><b>Executors:</b> {resourceRecommendation.recommendation?.num_executors}</div>
+                  <div><b>Shuffle partitions:</b> {resourceRecommendation.recommendation?.shuffle_partitions}</div>
+                  <div><b>Dynamic allocation:</b> {resourceRecommendation.recommendation?.dynamic_allocation ? "On" : "Off"}</div>
+                  <div><b>AQE:</b> {resourceRecommendation.recommendation?.aqe_enabled ? "On" : "Off"}</div>
+                </div>
+              </div>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+              {[
+                ["driver_memory", "Driver memory"],
+                ["driver_cores", "Driver cores"],
+                ["executor_memory", "Executor memory"],
+                ["executor_cores", "Executor cores"],
+                ["num_executors", "Executors"],
+                ["shuffle_partitions", "Shuffle partitions"],
+              ].map(([key, label]) => (
+                <label key={key} style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, color: C.g600 }}>
+                  <span>{label}</span>
+                  <input value={resourceConfig[key] ?? ""} onChange={e => setResourceConfig(c => ({ ...c, [key]: key.includes("memory") ? e.target.value : Number(e.target.value) }))} style={{ padding: "8px 10px", borderRadius: 8, border: `1px solid ${C.g200}`, fontSize: 12 }} />
+                </label>
+              ))}
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {/* Input Dataset Config Modal */}
       {configModal?.type === "input_dataset" && (
