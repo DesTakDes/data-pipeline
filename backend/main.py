@@ -97,6 +97,8 @@ def generate_task_file(
     tasks_json = json.dumps(transforms, ensure_ascii=True)
     safe_input = re.sub(r'[^a-zA-Z0-9_.]', '', input_table)
     safe_out   = re.sub(r'[^a-z0-9_]', '_', output_name.lower()).strip('_') or "output"
+    if safe_out and safe_out[0].isdigit():
+        safe_out = 't_' + safe_out
     now_str    = datetime.now().isoformat()
     pg_host    = PG_CONFIG["host"]
     pg_port    = PG_CONFIG["port"]
@@ -188,6 +190,8 @@ def _run_spark(input_table, output_name, transforms, row_count):
     from pyspark.sql import SparkSession, functions as F, Window
 
     safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+    if safe_out and safe_out[0].isdigit():
+        safe_out = \'t_\' + safe_out
     optimal_partitions = max(SHUFFLE_PARTITIONS, row_count // 100_000 + 1)
     BROADCAST_MAX_MB = 200
 
@@ -334,9 +338,13 @@ def _run_spark(input_table, output_name, transforms, row_count):
                     is_cross = "CROSS" in raw_type
                     join_type = raw_type.replace(" JOIN", "").lower().replace("full outer", "outer")
 
-                    dup_cols = [c for c in right_df.columns if c in df.columns and c != right_col]
+                    right_join_col = right_col
+                    dup_cols = [c for c in right_df.columns if c in df.columns]
                     for c in dup_cols:
-                        right_df = right_df.withColumnRenamed(c, f"{c}_right")
+                        new_name = f"{c}_right"
+                        right_df = right_df.withColumnRenamed(c, new_name)
+                        if c == right_col:
+                            right_join_col = new_name
 
                     try:
                         right_size_mb = _estimate_mb(_get_conn(), right_table)
@@ -349,7 +357,9 @@ def _run_spark(input_table, output_name, transforms, row_count):
                     if is_cross:
                         df = df.crossJoin(right_df)
                     elif right_col:
-                        df = df.join(right_df, df[left_col] == right_df[right_col], join_type)
+                        df = df.join(right_df, df[left_col] == right_df[right_join_col], join_type)
+                        if right_join_col != left_col:
+                            df = df.drop(right_join_col)
 
             elif ntype == "calc":
                 new_col = (cfg.get("newColName") or "result").strip()
@@ -425,7 +435,7 @@ def _run_spark(input_table, output_name, transforms, row_count):
 
     df.write.jdbc(
         url="jdbc:postgresql://postgres:5432/airflow",
-        table=f"warehouse.{safe_out}",
+        table=f\'warehouse."{safe_out}"\',
         mode="overwrite",
         properties={"user": "airflow", "password": "airflow", "driver": "org.postgresql.Driver"},
     )
@@ -513,6 +523,8 @@ def run(run_ids, backend_url=BACKEND_URL):
     """
     tbl      = INPUT_TABLE if "." in INPUT_TABLE else f"staging.{INPUT_TABLE}"
     safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',OUTPUT_NAME.lower()).strip(\'_\') or "output"
+    if safe_out and safe_out[0].isdigit():
+        safe_out = \'t_\' + safe_out
 
     print(f"[Task:{TASK_ID}] engine=spark (single-engine architecture)")
 
@@ -1806,18 +1818,25 @@ def apply_spark_transforms(df, transforms, spark, get_right_df=None):
                 is_cross  = "CROSS" in raw_type
                 join_type = raw_type.replace(" JOIN", "").lower().replace("full outer", "outer")
 
-                dup_cols = [c for c in right_df.columns if c in df.columns and c != right_col]
+                if not right_col:
+                    raise RuntimeError("Join: rightCol is required for non-cross joins") if not is_cross else None
+                if not is_cross and (left_col not in df.columns or right_col not in right_df.columns):
+                    raise RuntimeError(f"Join: column not found ({left_col} / {right_col})")
+
+                right_join_col = right_col
+                dup_cols = [c for c in right_df.columns if c in df.columns]
                 for c in dup_cols:
-                    right_df = right_df.withColumnRenamed(c, f"{c}_right")
+                    new_name = f"{c}_right"
+                    right_df = right_df.withColumnRenamed(c, new_name)
+                    if c == right_col:
+                        right_join_col = new_name
 
                 if is_cross:
                     df = df.crossJoin(right_df)
                 else:
-                    if not right_col:
-                        raise RuntimeError("Join: rightCol is required for non-cross joins")
-                    if left_col not in df.columns or right_col not in right_df.columns:
-                        raise RuntimeError(f"Join: column not found ({left_col} / {right_col})")
-                    df = df.join(right_df, df[left_col] == right_df[right_col], join_type)
+                    df = df.join(right_df, df[left_col] == right_df[right_join_col], join_type)
+                    if right_join_col != left_col:
+                        df = df.drop(right_join_col)
 
             elif ntype == "pyspark":
                 code = cfg.get("code", "")

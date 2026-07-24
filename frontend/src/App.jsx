@@ -257,7 +257,6 @@ function NodePreviewPanel({ node, datasets, edges, nodes, onClose }) {
       return;
     }
 
-    // Utility node ATAU Output node -> preview lewat Spark pipeline engine
     if (!isInput) {
       const sourceEdge = edges.find(e => e.target === node.id);
       if (!sourceEdge) {
@@ -292,8 +291,12 @@ function NodePreviewPanel({ node, datasets, edges, nodes, onClose }) {
         })
         .finally(() => setLoading(false));
     }
-  }, [node?.id]);
-
+  }, [
+    node?.id,
+    JSON.stringify(node?.data?.config),
+    JSON.stringify(edges.map(e => `${e.source}->${e.target}`)),
+    JSON.stringify(nodes.map(n => n.data?.config)),
+  ]);
 
   const downloadCSV = () => {
     if (!data?.rows?.length) return;

@@ -348,6 +348,14 @@ def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup,
         join_type = (config.get("joinType", "INNER JOIN")
                      .replace(" JOIN", "").lower().replace("full outer", "outer"))
 
+        right_join_col = right_col
+        dup_cols = [c for c in right_df.columns if c in df.columns]
+        for c in dup_cols:
+            new_name = f"{c}_right"
+            right_df = right_df.withColumnRenamed(c, new_name)
+            if c == right_col:
+                right_join_col = new_name
+
         # Broadcast tabel kanan yang kecil -> hindari shuffle join sama sekali.
         # Ukuran diambil dari right_size_lookup (mis. pg_total_relation_size),
         # bukan dengan menghitung df secara langsung (mahal & bisa trigger job).
@@ -356,7 +364,10 @@ def apply_node_transform(spark, df, node: dict, node_map: dict, right_df_lookup,
             right_df = F.broadcast(right_df)
             print(f"[SparkEngine] join_data: broadcast tabel kanan (~{right_size_mb:.1f} MB)")
 
-        return df.join(right_df, df[left_col] == right_df[right_col], join_type)
+        joined = df.join(right_df, df[left_col] == right_df[right_join_col], join_type)
+        if right_join_col != left_col:
+            joined = joined.drop(right_join_col)
+        return joined
 
     if ntype == "calc":
         new_col = (config.get("newColName") or "result").strip()
