@@ -611,16 +611,41 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     toast("Workflow saved!", "success");
   }, [nodes, edges, workflow, onSave, toast]);
 
+  const findInputTableForNode = (targetNodeId, nodes, edges) => {
+    let current = targetNodeId;
+    while (current) {
+      const node = nodes.find(n => n.id === current);
+      if (!node) return null;
+      if (node.data.type === "input_dataset") {
+        const ds = node.data.config?.dataset;
+        if (!ds) return null;
+        return ds.table_name
+          ? `staging.${ds.table_name}`
+          : `staging.${ds.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g,'_')}`;
+      }
+      const edge = edges.find(e => e.target === current);
+      if (!edge) return null;
+      current = edge.source;
+    }
+    return null;
+  };
+
   const buildTasks = useCallback(() => {
     const outputNodes = nodes.filter(n => n.data.type === "output_dataset" && n.data.config?.outputName);
-    const inputNode   = nodes.find(n => n.data.type === "input_dataset" && n.data.config?.dataset);
-    if (!inputNode || !outputNodes.length) return [];
+    if (!outputNodes.length) return [];
 
     return outputNodes.map((outNode, idx) => {
-      const taskId    = outNode.data.config?.taskId || `task_${idx + 1}`;
-      const transforms = buildTransformChain(outNode.id, nodes, edges).filter(t => t.type !== "output_dataset");
-      const depends_on = [];
-      return { task_id: taskId, output_name: outNode.data.config.outputName, transforms, depends_on };
+      const taskId      = outNode.data.config?.taskId || `task_${idx + 1}`;
+      const transforms  = buildTransformChain(outNode.id, nodes, edges).filter(t => t.type !== "output_dataset");
+      const inputTable  = findInputTableForNode(outNode.id, nodes, edges);
+      const depends_on  = [];
+      return {
+        task_id: taskId,
+        output_name: outNode.data.config.outputName,
+        input_table: inputTable,   // ← now correctly per-branch, not global
+        transforms,
+        depends_on,
+      };
     });
   }, [nodes, edges]);
 
@@ -648,6 +673,7 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     if (!inputNodes.length)  return toast("Add an Input Dataset node first", "error");
     if (!outputNodes.length) return toast("Add an Output Dataset node first", "error");
     if (!inputNodes[0].data.config?.dataset)  return toast("Configure Input Dataset first", "error");
+
     const unconfigOut = outputNodes.find(n => !n.data.config?.outputName);
     if (unconfigOut) return toast("All Output Dataset nodes must be configured", "error");
 
@@ -655,9 +681,22 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
     const disconnected = utilNodes.find(n => !edges.some(e => e.target === n.id));
     if (disconnected) return toast(`Node "${disconnected.data.label}" is not connected`, "error");
 
-    const input = inputNodes[0].data.config.dataset;
+    // Build tasks FIRST — everything below depends on this
     const tasks = buildTasks();
-    const inputTable = input.table_name ? `staging.${input.table_name}` : `staging.${input.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/\s+/g,'_')}`;
+
+    const missingInput = tasks.find(t => !t.input_table);
+    if (missingInput) {
+      return toast(`Task "${missingInput.task_id}" has no traceable Input Dataset — check its connections`, "error");
+    }
+
+    // Fallback only used by legacy/global backend paths — real per-task
+    // input_table values (set inside buildTasks) take priority server-side.
+    const fallbackInput = tasks[0]?.input_table || "";
+
+    // Use the FIRST input dataset just for the resource-sizing profile call
+    // (this only affects Spark memory/executor recommendations, not which
+    // data each task actually reads).
+    const input = inputNodes[0].data.config.dataset;
 
     try {
       const profilePayload = {
@@ -677,7 +716,7 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
       const r = await API.runPipeline({
         workflow_id:   workflow.id,
         workflow_name: workflow.name,
-        input_table:   inputTable,
+        input_table:   fallbackInput,
         tasks,
         description:   workflow.description || "",
       });
@@ -685,6 +724,8 @@ function WorkflowEditor({ workflow, datasets, onSave, onBack, toast }) {
       toast(`Spark Pipeline triggered! DAG: ${dag_id}`, "success");
       setDagStatus({ dag_id, state: "queued", run_id });
       handleSave();
+
+
 
       pollRef.current = setInterval(async () => {
         try {

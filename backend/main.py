@@ -19,6 +19,7 @@ from typing import Optional
 from pathlib import Path
 import upload_worker
 import spark_engine
+import spark_config
 
 app = FastAPI(title="ETLFlow API")
 
@@ -79,6 +80,52 @@ def _q(cols: list) -> str:
 #   - How to run DuckDB / Spark / Postgres
 #   - How to write output to warehouse + parquet
 # ════════════════════════════════════════════════════════════════════════════
+
+def _detect_resources_and_tune(row_count):
+    import os
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpu_count = os.cpu_count() or 2
+
+    mem_limit_bytes = None
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                val = f.read().strip()
+                if val.isdigit() and int(val) < (1 << 62):
+                    mem_limit_bytes = int(val)
+                    break
+        except (FileNotFoundError, PermissionError):
+            continue
+    if mem_limit_bytes is None:
+        import psutil
+        mem_limit_bytes = psutil.virtual_memory().total
+
+    usable_mb = (mem_limit_bytes / 1024 / 1024) * 0.6
+    usable_cores = max(1, cpu_count - 1)
+
+    if row_count < 500_000:
+        want_gb, want_cores, want_execs = 1, 1, 1
+    elif row_count < 3_000_000:
+        want_gb, want_cores, want_execs = 2, 2, 2
+    else:
+        want_gb, want_cores, want_execs = 4, 2, 3
+
+    exec_mem_gb   = max(1, min(want_gb, int(usable_mb / 1024 / max(1, want_execs))))
+    exec_cores    = min(want_cores, usable_cores)
+    num_executors = min(want_execs, max(1, usable_cores // exec_cores))
+
+    print(f"[Spark] Auto-tuned: {exec_mem_gb}g mem, {exec_cores} cores, {num_executors} executors "
+          f"(host: {usable_cores+1} cores, {mem_limit_bytes/1024/1024:.0f}MB mem limit)")
+
+    return {
+        "executor_memory": f"{exec_mem_gb}g",
+        "executor_memoryOverhead": f"{max(256, int(exec_mem_gb*1024*0.25))}m",
+        "executor_cores": str(exec_cores),
+        "max_executors": str(num_executors),
+        "shuffle_partitions": max(8, num_executors * exec_cores * 2),
+    }
 
 def generate_task_file(
     task_id:      str,
@@ -172,7 +219,7 @@ def _sql_when_fragment(col, condition, value, result):
     op = condition if condition in (\'=\', \'!=\') else \'=\'
     return f"WHEN {col_ref} {op} {repr(value)} THEN {result_lit}"
 
-
+# ── Estimate ─────────────────────────────────────────────────────────────
 def _estimate_mb(pg_conn, table):
     try:
         cur = pg_conn.cursor()
@@ -184,35 +231,139 @@ def _estimate_mb(pg_conn, table):
         return 0.0
 
 
+def _estimate_avg_row_bytes(pg_conn, table_name, schema="staging"):
+    TYPE_BYTE_ESTIMATES = {
+        "smallint": 16, "integer": 16, "bigint": 24,
+        "real": 16, "double precision": 24, "numeric": 32,
+        "boolean": 16,
+        "date": 24, "timestamp without time zone": 32, "timestamp with time zone": 32,
+        "character varying": 60,
+        "text": 100,
+        "character": 40,
+        "json": 200, "jsonb": 200,
+        "uuid": 40,
+    }
+    DEFAULT_BYTES = 40
+    try:
+        cur = pg_conn.cursor()
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+        """, (schema, table_name))
+        cols = cur.fetchall()
+        cur.close()
+        if not cols:
+            print(f"[Spark] Could not find columns for {schema}.{table_name}, using default row size")
+            return 200
+        total_bytes = sum(TYPE_BYTE_ESTIMATES.get(dt, DEFAULT_BYTES) for _, dt in cols)
+        total_bytes += 50
+        print(f"[Spark] Estimated avg row size: {total_bytes} bytes across {len(cols)} columns for {schema}.{table_name}")
+        return total_bytes
+    except Exception as e:
+        print(f"[Spark] Could not estimate row size ({e}), using default 200 bytes")
+        return 200
+
+
+def _compute_read_partitions(row_count, exec_mem_gb, exec_cores, avg_row_bytes=200):
+    safe_partition_bytes = (exec_mem_gb * 1024 * 1024 * 1024) * 0.15
+    rows_per_partition_by_memory = max(1, int(safe_partition_bytes / avg_row_bytes))
+    partitions_by_memory = max(1, row_count // rows_per_partition_by_memory + 1)
+    partitions_by_cores = exec_cores * 6
+    read_partitions = max(partitions_by_memory, partitions_by_cores)
+    read_partitions = max(8, min(300, read_partitions))
+    return read_partitions
+
+# ── Spark Cluster ──────────────────────────────────────────────────────────────
+def _query_spark_cluster_capacity():
+    """
+    Ask the Spark Master directly how much memory/cores the cluster
+    actually has right now (total and currently free across all workers).
+    This reflects real capacity — set via SPARK_WORKER_MEMORY/CORES in .env —
+    rather than guessing from container cgroups that aren't actually capped.
+    """
+    import requests
+    try:
+        r = requests.get("http://spark:8080/json/", timeout=5)
+        data = r.json()
+        total_mem_mb  = data.get("memory", 2048)
+        used_mem_mb   = data.get("memoryused", 0)
+        total_cores   = data.get("cores", 2)
+        used_cores    = data.get("coresused", 0)
+        return {
+            "free_memory_mb": max(512, total_mem_mb - used_mem_mb),
+            "total_memory_mb": total_mem_mb,
+            "free_cores": max(1, total_cores - used_cores),
+            "total_cores": total_cores,
+        }
+    except Exception as e:
+        print(f"[Spark] Could not query cluster capacity ({e}), using conservative defaults")
+        return {"free_memory_mb": 1024, "total_memory_mb": 2048, "free_cores": 1, "total_cores": 2}
+
+
 # ── Spark Runner ──────────────────────────────────────────────────────────────
 
 def _run_spark(input_table, output_name, transforms, row_count):
-    from pyspark.sql import SparkSession, functions as F, Window
+    from pyspark.sql import SparkSession, functions as F
 
-    safe_out = re.sub(r\'[^a-z0-9_]\',\'_\',output_name.lower()).strip(\'_\') or "output"
+    import requests
+    try:
+        r = requests.get("http://spark:8080/json/", timeout=5)
+        cluster = r.json()
+        total_mem_mb = cluster.get("memory", 2048)
+    except Exception:
+        total_mem_mb = 2048
+
+    exec_mem_gb = max(1, int((total_mem_mb * 0.7) / 1024))
+    exec_mem_overhead_mb = max(256, int(exec_mem_gb * 1024 * 0.25))
+
+    safe_out = re.sub(r'[^a-z0-9_]','_',output_name.lower()).strip('_') or "output"
     if safe_out and safe_out[0].isdigit():
-        safe_out = \'t_\' + safe_out
-    optimal_partitions = max(SHUFFLE_PARTITIONS, row_count // 100_000 + 1)
-    BROADCAST_MAX_MB = 200
+        safe_out = 't_' + safe_out
 
+    # ── Estimate row size + compute partitions BEFORE creating the session ──
+    try:
+        schema_name, table_name_only = (input_table.split(".", 1) + [""])[:2] if "." in input_table else ("staging", input_table)
+        pg_conn_for_estimate = psycopg2.connect(
+            host="postgres", port=5432, database="airflow",
+            user="airflow", password="airflow",
+        )
+        avg_row_bytes = _estimate_avg_row_bytes(pg_conn_for_estimate, table_name_only.strip('"'), schema_name)
+        pg_conn_for_estimate.close()
+    except Exception as e:
+        print(f"[Spark] Row size estimation failed ({e}), using default 200 bytes")
+        avg_row_bytes = 200
+
+    read_partitions = _compute_read_partitions(
+        row_count=row_count,
+        exec_mem_gb=exec_mem_gb,
+        exec_cores=2,   # match spark.executor.cores below
+        avg_row_bytes=avg_row_bytes,
+    )
+    print(f"[Spark] Cluster: {total_mem_mb}MB. Using {exec_mem_gb}g. "
+          f"Reading {row_count:,} rows using {read_partitions} partitions "
+          f"(~{row_count // read_partitions:,} rows/partition, ~{avg_row_bytes} bytes/row)")
+
+    # ── NOW create the SparkSession, using the values computed above ────────
     spark = (SparkSession.builder
         .appName(f"ETLFlow_{DAG_ID}_{TASK_ID}_{safe_out}")
         .config("spark.master","spark://spark:7077")
         .config("spark.jars","/opt/spark/jars/postgresql-42.6.0.jar")
-        .config("spark.executor.memory","2g")
-        .config("spark.dynamicAllocation.enabled","true")
-        .config("spark.dynamicAllocation.maxExecutors","4")
+        .config("spark.executor.memory", f"{exec_mem_gb}g")
+        .config("spark.executor.memoryOverhead", f"{exec_mem_overhead_mb}m")
+        .config("spark.executor.cores", "2")
+        .config("spark.executor.instances", "1")
+        .config("spark.dynamicAllocation.enabled","false")
         .config("spark.sql.adaptive.enabled","true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled","true")
-        .config("spark.sql.shuffle.partitions", str(optimal_partitions))
-        .config("spark.default.parallelism", str(optimal_partitions))
-        .config("spark.sql.autoBroadcastJoinThreshold", str(BROADCAST_MAX_MB * 1024 * 1024))
+        .config("spark.sql.adaptive.coalescePartitions.enabled","false")
+        .config("spark.sql.shuffle.partitions", str(read_partitions))
         .getOrCreate())
 
     TYPE_MAP = _resolve_types_spark_map()
 
-    df = _read_jdbc_table(spark, input_table, num_partitions=min(8, optimal_partitions))
-
+    # ── Read ONCE, using the partition count already computed above ────────
+    df = _read_jdbc_table(spark, input_table, num_partitions=read_partitions)
+    
     for tx in transforms:
         ntype = tx.get("type", "")
         cfg = tx.get("config") or {}
@@ -338,6 +489,8 @@ def _run_spark(input_table, output_name, transforms, row_count):
                     is_cross = "CROSS" in raw_type
                     join_type = raw_type.replace(" JOIN", "").lower().replace("full outer", "outer")
 
+                    # Rename any overlapping column names (including the right
+                    # join key itself) so the result never has duplicate names.
                     right_join_col = right_col
                     dup_cols = [c for c in right_df.columns if c in df.columns]
                     for c in dup_cols:
@@ -353,10 +506,15 @@ def _run_spark(input_table, output_name, transforms, row_count):
                     if right_size_mb <= BROADCAST_MAX_MB:
                         right_df = F.broadcast(right_df)
                         print(f"[Spark] join_data: broadcast tabel kanan (~{right_size_mb:.1f} MB)")
+                    else:
+                        # Not broadcasting -> repartition both sides on the
+                        # join key to avoid skew across the shuffle.
+                        df = df.repartition(exec_cores * 2, F.col(left_col))
+                        right_df = right_df.repartition(exec_cores * 2, F.col(right_join_col))
 
                     if is_cross:
                         df = df.crossJoin(right_df)
-                    elif right_col:
+                    elif right_join_col:
                         df = df.join(right_df, df[left_col] == right_df[right_join_col], join_type)
                         if right_join_col != left_col:
                             df = df.drop(right_join_col)
@@ -433,19 +591,31 @@ def _run_spark(input_table, output_name, transforms, row_count):
         except Exception as e:
             print(f"[Spark] {ntype} error: {e} — dilewati")
 
+    # ── Repartition before writing so the JDBC writer sends manageable,
+    # evenly-sized batches instead of one executor choking on one huge
+    # partition. ────────────────────────────────────────────────────────
+    JOIN_FANOUT_SAFETY = 3  # assume join could multiply rows up to 3x
+    estimated_rows = row_count * JOIN_FANOUT_SAFETY
+
+
+    spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "false")
+
     df.write.jdbc(
         url="jdbc:postgresql://postgres:5432/airflow",
-        table=f\'warehouse."{safe_out}"\',
+        table=f'warehouse."{safe_out}"',
         mode="overwrite",
-        properties={"user": "airflow", "password": "airflow", "driver": "org.postgresql.Driver"},
+        properties={
+            "user": "airflow",
+            "password": "airflow",
+            "driver": "org.postgresql.Driver",
+            "batchsize": "50000",
+        },
     )
 
     if row_count > 10_000:
         os.makedirs(PARQUET_DIR, exist_ok=True)
         parquet_path = f"{PARQUET_DIR}/{safe_out}.parquet"
-        output_parts = max(1, row_count // 500_000)
-        (df.coalesce(output_parts).write.mode("overwrite")
-           .option("compression", "snappy").parquet(parquet_path))
+        (df.write.mode("overwrite").option("compression", "snappy").parquet(parquet_path))
         print(f"[Spark] Snappy Parquet saved: {parquet_path}")
 
     spark.stop()
@@ -773,6 +943,21 @@ def generate_dag(
 
 
 generate_spark_dag = generate_dag
+
+# ════════════════════════════════════════════════════════════════════════════
+# HOST
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/spark/host-resources")
+def spark_host_resources():
+    return spark_config.detect_host_resources()
+
+@app.get("/api/spark/resource-recommendation")
+def resource_recommendation(file_size_bytes: int = 0, row_count: int = 0, col_count: int = 0):
+    profile = spark_config.estimate_dataset_profile(file_size_bytes, row_count, col_count)
+    host    = spark_config.detect_host_resources()
+    rec     = spark_config.compute_auto_tuned_config(profile, host)
+    return {"profile": profile, "host": host, "recommendation": rec}
 
 # ════════════════════════════════════════════════════════════════════════════
 # HEALTH

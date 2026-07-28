@@ -523,6 +523,7 @@ function JoinDataConfig({ columns, config, onSave, onClose, allNodes }) {
   const inputNodes = (allNodes || []).filter(n => n.data?.type === "input_dataset" && n.data?.config?.dataset);
   const rightDataset = inputNodes.find(n => n.id === rightNodeId)?.data?.config?.dataset;
   const rightColumns = rightDataset?.columns || [];
+  const namesMismatch = leftCol && rightCol && leftCol.toLowerCase() !== rightCol.toLowerCase();
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <p style={{ fontSize: 12, color: C.g500, marginBottom: 16, lineHeight: 1.6 }}>Join two datasets. The first connected node is the <strong>left table</strong>.</p>
